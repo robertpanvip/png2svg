@@ -561,9 +561,332 @@ fn rotated_ellipse_subpath(cx: f32, cy: f32, rx: f32, ry: f32, theta_rad: f32) -
     )
 }
 
+// ---------------- 直线 / 圆弧 分段 ----------------
+//
+// 把一条简化轮廓切成「直线段(L)」与「真圆弧(A)」交替的子路径。这样：
+//   - 对角/斜线（栅格化后是台阶）被合并成单条直线，消除毛刺；
+//   - 圆角/倒角（部分圆弧）被识别成 SVG 弧命令，而不是碎成多边形或整条贝塞尔。
+// 自由曲线（花瓣/云朵，曲率处处变化）不应进入此分支，由上层改走贝塞尔。
+
+/// 过三点的最小二乘圆拟合（解析解）。返回 ((cx, cy), r)。
+fn fit_circle_3pt(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<((f64, f64), f64)> {
+    let (x1, y1) = (a.0 as f64, a.1 as f64);
+    let (x2, y2) = (b.0 as f64, b.1 as f64);
+    let (x3, y3) = (c.0 as f64, c.1 as f64);
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let ux = ((x1 * x1 + y1 * y1) * (y2 - y3)
+        + (x2 * x2 + y2 * y2) * (y3 - y1)
+        + (x3 * x3 + y3 * y3) * (y1 - y2))
+        / d;
+    let uy = ((x1 * x1 + y1 * y1) * (x3 - x2)
+        + (x2 * x2 + y2 * y2) * (x1 - x3)
+        + (x3 * x3 + y3 * y3) * (x2 - x1))
+        / d;
+    let r = ((x1 - ux).powi(2) + (y1 - uy).powi(2)).sqrt();
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    Some(((ux, uy), r))
+}
+
+#[inline]
+fn angle_of(p: (f32, f32), cx: f64, cy: f64) -> f64 {
+    (p.1 as f64 - cy).atan2(p.0 as f64 - cx)
+}
+
+/// 把闭环切成 直线(L) / 真圆弧(A) 子路径（基于「运行」的贪心分段：弧优先）。
+///
+/// 设计要点（修复两处旧 bug）：
+/// 1. 斜线毛刺：RDP 简化已把斜线台阶压成单条直边（偏差 < eps），本函数对直边运行输出一条 L，
+///    把台阶合并，故斜线不再有锯齿状毛刺。
+/// 2. 倒角/圆角识别成圆：RDP 保证“每条简化边”本身偏差 < eps，因此逐边判“弯”会失效（每段
+///    看起来都直 → 整圈退化为全 L 多边形，倒角出不来）。故改为**跨越多条边的运行级判定**：
+///    - 先尝试“弧运行”：从当前顶点起逐步扩大弦跨，只要整段原始点都落在同一圆上（圆拟合良好）
+///      就继续延伸；一旦碰到直边（点离开该圆）即停。运行末再校验“圆弧偏差 ≪ 该运行弦的拱高”，
+///      成立则输出一段真圆弧 A（否则视为非圆，退化为直/折线）。
+///    - 弧不行则尝试“直边运行”：从当前顶点起扩大累计弦，只要全部原始点到该弦偏差 ≤ line_eps
+///      就继续；用于吸收台阶/轻微折角。
+/// 起点选在一条直边，避免从弧中间起步导致回绕重复处理。圆/椭圆已在上层拦截；星形等尖角多边形
+/// 因每段是直线、圆拟合返回共线(None)而走直边运行，保持尖角不磨圆；自由曲线由上层改走贝塞尔。
+fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
+    let line_eps = if eps < 1.0 { 1.0 } else { eps };
+    let arc_tol_abs = (eps * 4.0).max(3.0);
+    let pts = simplify_polygon(loop_, line_eps);
+    let n = pts.len();
+    if n < 3 {
+        if pts.len() >= 2 {
+            let mut s = format!("M {} {}", pts[0].0, pts[0].1);
+            for q in &pts[1..] {
+                s.push_str(&format!(" L {} {}", q.0, q.1));
+            }
+            s.push_str(" Z");
+            return s;
+        }
+        return String::new();
+    }
+
+    // 把每个简化顶点映射回原始轮廓索引（简化点来自原始轮廓，可按值精确查找）。
+    let loop_len = loop_.len();
+    let mut idx = vec![0usize; n];
+    let mut cursor = 0usize;
+    for k in 0..n {
+        let mut found = None;
+        for i in cursor..loop_len {
+            if loop_[i] == pts[k] {
+                found = Some(i);
+                break;
+            }
+        }
+        if found.is_none() {
+            for i in 0..cursor {
+                if loop_[i] == pts[k] {
+                    found = Some(i);
+                    break;
+                }
+            }
+        }
+        let fi = found.unwrap_or(cursor);
+        idx[k] = fi;
+        cursor = fi + 1;
+    }
+
+    // 辅助：顶点 a..=b 之间（环形）的原始轮廓点到弦 pts[a]→pts[b] 的最大垂直距离（拱高）。
+    let chord_max_dev = |a: usize, b: usize| -> f32 {
+        let ca = pts[a % n];
+        let cb = pts[b % n];
+        let ia = idx[a % n];
+        let ib = idx[b % n];
+        let mut maxd = 0.0f32;
+        let mut i = ia;
+        loop {
+            if i != ia && i != ib {
+                let d = point_line_dist(loop_[i], ca, cb);
+                if d > maxd {
+                    maxd = d;
+                }
+            }
+            if i == ib {
+                break;
+            }
+            i = (i + 1) % loop_len;
+            if i == ia {
+                break;
+            }
+        }
+        maxd
+    };
+    // 辅助：收集顶点 a..=b 之间的原始轮廓点（含两端弦点）。
+    let collect_run = |a: usize, b: usize| -> Vec<(f32, f32)> {
+        let ia = idx[a % n];
+        let ib = idx[b % n];
+        let mut run = Vec::new();
+        let mut i = ia;
+        loop {
+            run.push(loop_[i]);
+            if i == ib {
+                break;
+            }
+            i = (i + 1) % loop_len;
+            if i == ia {
+                break;
+            }
+        }
+        run
+    };
+
+    // 起点：选第一条直边起步，避免从弧中间开始导致回绕重复处理。
+    let mut start_e = 0usize;
+    for e in 0..n {
+        if chord_max_dev(e, (e + 1) % n) <= line_eps {
+            start_e = e;
+            break;
+        }
+    }
+
+    // 每个顶点的有符号转角（弧度），用于判别“尖角”与“平滑弧”。
+    let mut turn = vec![0.0f64; n];
+    for k in 0..n {
+        let a = pts[(k + n - 1) % n];
+        let b = pts[k];
+        let c = pts[(k + 1) % n];
+        let v1 = (b.0 as f64 - a.0 as f64, b.1 as f64 - a.1 as f64);
+        let v2 = (c.0 as f64 - b.0 as f64, c.1 as f64 - b.1 as f64);
+        let cross = v1.0 * v2.1 - v1.1 * v2.0;
+        let dot = v1.0 * v2.0 + v1.1 * v2.1;
+        turn[k] = cross.atan2(dot);
+    }
+    // 弧运行的端顶点转角上限：超过即视为“尖角”（如方块/星形/平行四边形的 90°+ 折角），
+    // 不应识别成圆弧；下限避免把近直线也当弧。
+    const T_HI: f64 = 1.25; // ~72°
+    const T_LO: f64 = 0.12; // ~7°
+
+    // 生成路径
+    let mut s = format!("M {} {}", pts[start_e].0, pts[start_e].1);
+    let mut i = start_e;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > n + 2 {
+            break;
+        }
+        // 1) 先尝试弧运行（弧优先）。关键：参考圆只在运行首段拟合一次并固定，后续所有点都
+        //    与该【固定】圆比较（紧绝对容差，不随半径放大）。这样一旦运行越过倒角进入直边，
+        //    直边点与参考圆偏差超限即停，杜绝旧版“每步重拟合→大圆吸附整圈”的失控。直边本身
+        //    因首段共线而无法建立参考圆，自然止步 → 改走直边运行。
+        let mut k = i;
+        let mut ref_circ: Option<(f64, f64, f64)> = None;
+        let mut last_total = 0.0f64;
+        let mut last_adev = 0.0f32;
+        let mut advanced = 0usize;
+        loop {
+            let nxt = (k + 1) % n;
+            if nxt == i || nxt == start_e {
+                break;
+            }
+            // 转角门限：端顶点转角过大（尖角，如方块/星形/平行四边形的 90°+ 折角）即停，
+            // 避免把尖角误识别成圆弧。
+            if turn[nxt].abs() > T_HI {
+                break;
+            }
+            let run = collect_run(i, nxt);
+            if run.len() < 3 {
+                k = nxt;
+                advanced += 1;
+                continue;
+            }
+            // 建立固定参考圆：需运行已跨越 ≥2 条简化边才三点定圆，半径才稳定
+            // （首段过短会受栅格噪声放大，半径失真→整段偏差超限而提前停）。
+            if ref_circ.is_none() {
+                if advanced < 2 {
+                    k = nxt;
+                    advanced += 1;
+                    continue;
+                }
+                match fit_circle_3pt(run[0], run[run.len() / 2], run[run.len() - 1]) {
+                    Some((center, rr))
+                        if rr >= 1.0
+                            && rr < 10000.0
+                            // 半径/弦长 上限：直边会被“浅圆”近似（半径巨大），借此剔除，
+                            // 仅保留真正的圆弧（r 与弦长同量级）。
+                            && {
+                                let chord = ((run[0].0 as f64 - run[run.len() - 1].0 as f64)
+                                    .hypot(run[0].1 as f64 - run[run.len() - 1].1 as f64))
+                                    .abs();
+                                rr <= 1.5 * chord
+                            } =>
+                    {
+                        ref_circ = Some((center.0, center.1, rr));
+                    }
+                    _ => break,
+                }
+            }
+            let (cx, cy, r) = ref_circ.unwrap();
+            // 校验：全部点落在固定圆上（紧绝对容差）、绕心角度单调、总转角有界(≤π)
+            let tol = arc_tol_abs as f64;
+            let mut prev = angle_of(run[0], cx, cy);
+            let mut dir = 0i32;
+            let mut total = 0.0f64;
+            let mut maxd = 0.0f64;
+            let mut ok = true;
+            for q in &run {
+                let dist = ((q.0 as f64 - cx).hypot(q.1 as f64 - cy) - r).abs();
+                if dist > maxd {
+                    maxd = dist;
+                }
+                if dist > tol {
+                    ok = false;
+                    break;
+                }
+                let ang = angle_of(*q, cx, cy);
+                let mut da = ang - prev;
+                while da > std::f64::consts::PI {
+                    da -= 2.0 * std::f64::consts::PI;
+                }
+                while da < -std::f64::consts::PI {
+                    da += 2.0 * std::f64::consts::PI;
+                }
+                if dir == 0 && da > 1e-9 {
+                    dir = 1;
+                } else if dir == 0 && da < -1e-9 {
+                    dir = -1;
+                } else if (da > 1e-9 && dir < 0) || (da < -1e-9 && dir > 0) {
+                    ok = false;
+                    break;
+                }
+                total += da;
+                prev = ang;
+            }
+            if !ok || total.abs() > std::f64::consts::PI {
+                break;
+            }
+            last_total = total;
+            last_adev = maxd as f32;
+            k = nxt;
+            advanced += 1;
+        }
+        if advanced > 0 {
+            if let Some((_cx, _cy, r)) = ref_circ {
+                // 末校验：①运行弦拱高须明显大于圆弧拟合偏差（确为“曲线”而非“微抖的直线”）；
+                // ②总扫角须够大（≥~34°），否则只是被栅格磨圆的尖角/微弯，应保留为直线段。
+                let bow = chord_max_dev(i, k);
+                if bow > line_eps
+                    && last_adev < bow * 0.7
+                    && last_total.abs() > 0.6
+                {
+                    let end = pts[k];
+                    let sweep = if last_total < 0.0 { 1 } else { 0 };
+                    let large = if last_total.abs() > std::f64::consts::PI {
+                        1
+                    } else {
+                        0
+                    };
+                    s.push_str(&format!(
+                        " A {:.2} {:.2} 0 {} {} {:.2} {:.2}",
+                        r, r, large, sweep, end.0, end.1
+                    ));
+                    i = k;
+                    if i == start_e {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        // 2) 弧不行 → 直边运行：从 i 起扩大累计弦，只要全部原始点偏差 ≤ line_eps 就继续（吸收台阶/轻微折角）。
+        let mut j = i;
+        loop {
+            let nxt = (j + 1) % n;
+            if nxt == i || nxt == start_e {
+                break;
+            }
+            if chord_max_dev(i, nxt) <= line_eps {
+                j = nxt;
+            } else {
+                break;
+            }
+        }
+        if j == i {
+            // 没有任何可延伸的直边（退化情形）：强制前进一步，避免卡死
+            j = (i + 1) % n;
+        }
+        let end = pts[j];
+        s.push_str(&format!(" L {} {}", end.0, end.1));
+        i = j;
+        if i == start_e {
+            break;
+        }
+    }
+    s.push_str(" Z");
+    s
+}
+
 /// 把一个闭环渲染成 SVG 子路径：圆 → 弧；旋转椭圆（含轴对齐）→ 弧；否则回退。
-/// 回退时：若 smooth 且点数较多，则用「切线 + 曲率分析」重建为少数几条干净三次
-/// 贝塞尔（C 命令）；否则保留多边形。
+/// 回退时：若 smooth 且点数较多（轮廓处处弯曲，如花瓣/云朵），用「切线 + 曲率分析」
+/// 重建为少数干净三次贝塞尔（C 命令）；否则把轮廓切成「直线(L) + 真圆弧(A)」——这能
+/// 消除斜线台阶毛刺、并把圆角/倒角识别成圆弧。直线多边形（方块/星形）保持多边形、不磨角。
 fn loop_to_subpath(
     loop_: &[(f32, f32)],
     eps: f32,
@@ -597,23 +920,17 @@ fn loop_to_subpath(
         return String::new();
     }
     // 贝塞尔曲线检测：粗简化（压平像素台阶）后，若轮廓仍需很多段才能表示（>12），
-    // 说明它是处处弯曲的曲线（圆/椭圆/花瓣/云朵等）。转而用「切线 + 曲率分析」重建：
-    // 沿轮廓算每点切线与有符号曲率，在曲率极值/拐点/折角处分段，每段用端点切线 + 圆弧
-    // 手柄长度拟合一条三次贝塞尔（偏差超限再细分）；直线段保留为 L。这样得到的是几何上
-    // 少数几条干净贝塞尔，而非逐点插值。直线多边形（方块/星形/正多边形）粗化后只剩少数
-    // 边（≤12），保持多边形、不磨角。
+    // 说明它是处处弯曲的自由曲线（花瓣/云朵），而非“直线+圆弧”型（方块/星/圆角矩形）。
+    // 自由曲线用「切线 + 曲率分析」重建为少数干净三次贝塞尔；直线+圆弧型则交给
+    // segment_primitives：把轮廓分段为 直线(L) 与 真圆弧(A)，消除斜线台阶毛刺、
+    // 并把圆角/倒角识别成圆弧（而不是碎成多边形或整条贝塞尔）。
     if smooth && simp.len() >= 8 {
         let coarse = simplify_polygon(loop_, eps.max(3.0));
         if coarse.len() > 12 {
             return curvature_bezier_path(&simp);
         }
     }
-    let mut s = format!("M {} {}", simp[0].0, simp[0].1);
-    for p in &simp[1..] {
-        s.push_str(&format!(" L {} {}", p.0, p.1));
-    }
-    s.push_str(" Z");
-    s
+    segment_primitives(loop_, eps)
 }
 
 /// 闭合 Catmull-Rom 样条 → 三次贝塞尔路径（tension=1 标准系数）。
