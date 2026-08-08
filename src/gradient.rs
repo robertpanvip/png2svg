@@ -374,15 +374,27 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         let rg2b = r2_bi(bi_g, sxx, syy, sxy, sx2y, sxy2, sx2y2, tg);
         let rb2b = r2_bi(bi_b, sxx, syy, sxy, sx2y, sxy2, sx2y2, tb);
         bilinear_r2 = (rr2b + rg2b + rb2b) / 3.0;
-        // color = a + b·x' + c·y' + d·x'y'，其中 a = 均值（x',y' 已中心化）
+        // 双线性拟合在“中心化坐标 x'=x-mx, y'=y-my”下进行，得到
+        //   color = a + b·x' + c·y' + d·x'·y'（a = 均值）。
+        // 但 color_at 接收的是绝对坐标，故在此把系数改写成绝对形式
+        //   color = A + B·x + C·y + D·x·y
+        // 这样 color_at 直接代入绝对 (x,y) 即得正确颜色。
+        fn to_abs(a_c: f64, bi: [f64; 3], cx: f64, cy: f64) -> [f64; 4] {
+            let (b, c, d) = (bi[0], bi[1], bi[2]);
+            let a = a_c - b * cx - c * cy + d * cx * cy;
+            let bb = b - d * cy;
+            let cc = c - d * cx;
+            [a, bb, cc, d]
+        }
+        let (cx, cy) = (mx, my);
         mesh = Some(MeshCoef {
             minx: minx as f32,
             miny: miny as f32,
             maxx: maxx as f32,
             maxy: maxy as f32,
-            r: [mr, bi_r[0], bi_r[1], bi_r[2]],
-            g: [mg, bi_g[0], bi_g[1], bi_g[2]],
-            b: [mb, bi_b[0], bi_b[1], bi_b[2]],
+            r: to_abs(mr, bi_r, cx, cy),
+            g: to_abs(mg, bi_g, cx, cy),
+            b: to_abs(mb, bi_b, cx, cy),
         });
     }
 

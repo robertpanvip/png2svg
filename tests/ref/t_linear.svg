@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200"><defs><linearGradient id="lg" gradientUnits="userSpaceOnUse" x1="20" y1="100" x2="180" y2="100"><stop offset="0" stop-color="rgb(255,43,43)" /><stop offset="1" stop-color="rgb(43,75,255)" /></linearGradient></defs><rect x="20" y="40" width="160" height="120" rx="12" fill="url(#lg)" /></svg>

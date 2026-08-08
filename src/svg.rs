@@ -138,9 +138,9 @@ impl SvgBuilder {
         if width < 1.0 || height < 1.0 {
             return;
         }
-        // 网格分辨率：约 8px 一格，限制上限避免元素过多
-        let cols = (width / 8.0).max(4.0).min(64.0).round() as i32;
-        let rows = (height / 8.0).max(4.0).min(64.0).round() as i32;
+        // 网格分辨率：约 5px 一格（更贴近细渐变，减少块状 moiré），上限放宽到 80 避免元素过多
+        let cols = (width / 5.0).max(4.0).min(80.0).round() as i32;
+        let rows = (height / 5.0).max(4.0).min(80.0).round() as i32;
         let cw = width / cols as f32;
         let ch = height / rows as f32;
 

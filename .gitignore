@@ -19,3 +19,7 @@ out.svg
 # OS / 编辑器
 .DS_Store
 Thumbs.db
+
+# 测试依赖（pip --target 安装的 numpy/pillow，沙箱内路径易失效）与往返测试产物
+/tests/pylibs
+/tests/out
