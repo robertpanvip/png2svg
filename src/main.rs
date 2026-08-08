@@ -5,7 +5,9 @@
 //!     颜色 / alpha 差异自然分开，边界即轮廓。
 //!   - 每个区域再被识别为三类之一：
 //!        * 纯色（Solid）        —— 颜色近似恒定；
-//!        * 渐变（Gradient）     —— 颜色随位置线性变化（拟合平面 R² 高）；
+//!        * 渐变（Gradient）     —— 颜色随位置变化；细分为三类：
+//!                               线性渐变（平面，拟合 R² 高）/ 径向渐变（颜色随半径变化）/
+//!                               网格渐变（双线性四角场，单一方向无法表示）；
 //!        * 阴影（Shadow）       —— 半透明（平均 alpha 偏低），渲染时降低不透明度，
 //!                                  并画在底层，模拟投影。
 //!   识别顺序：先判阴影（alpha），再判渐变，最后兜底纯色。
@@ -120,19 +122,36 @@ fn main() {
     items.sort_by_key(|&(kind, _, _, _)| kind);
     for (kind, d, f, avg_a) in &items {
         let op = (avg_a / 255.0).clamp(0.0, 1.0);
+        // 根据渐变类型选择渲染方式
+        let render_grad = |builder: &mut svg::SvgBuilder, d: &str, f: &gradient::Fit, op: f32| {
+            match f.grad_kind {
+                gradient::GradKind::Linear => builder.add_gradient_path(
+                    d, f.start_pt, f.end_pt, f.start_color, f.end_color, op,
+                ),
+                gradient::GradKind::Radial => builder.add_radial_gradient_path(
+                    d, f.center, f.radius, f.rad_center, f.rad_rim, op,
+                ),
+                gradient::GradKind::Mesh => {
+                    if let Some(ref mesh) = f.mesh {
+                        builder.add_mesh_path(d, mesh, op);
+                    } else {
+                        // 不应发生：mesh 系数缺失时回退为线性
+                        builder.add_gradient_path(
+                            d, f.start_pt, f.end_pt, f.start_color, f.end_color, op,
+                        );
+                    }
+                }
+            }
+        };
         match *kind {
             KIND_SHADOW => {
                 if f.is_gradient {
-                    builder.add_gradient_path(
-                        d, f.start_pt, f.end_pt, f.start_color, f.end_color, op,
-                    );
+                    render_grad(&mut builder, d, f, op);
                 } else {
                     builder.add_solid_path(d, f.mean, op);
                 }
             }
-            KIND_GRADIENT => builder.add_gradient_path(
-                d, f.start_pt, f.end_pt, f.start_color, f.end_color, 1.0,
-            ),
+            KIND_GRADIENT => render_grad(&mut builder, d, f, 1.0),
             _ => builder.add_solid_path(d, f.mean, 1.0),
         }
     }
