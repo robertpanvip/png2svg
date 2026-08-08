@@ -1,0 +1,21 @@
+# Rust 构建产物（沙箱里多次换 target-dir 编译会留下 tdN 目录）
+/target
+/target2
+/td2
+/td3
+/td4
+/td5
+/td6
+/td7
+/td8
+/td9
+
+# 编译日志
+*.log
+
+# 中间 SVG 输出（保留 out2.svg 作为样例）
+out.svg
+
+# OS / 编辑器
+.DS_Store
+Thumbs.db
