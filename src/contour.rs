@@ -319,18 +319,222 @@ pub fn simplify_polygon(points: &[(f32, f32)], eps: f32) -> Vec<(f32, f32)> {
 }
 
 /// 把若干闭环拼成一个 SVG path（用 fill-rule=evenodd 时，第二环起为孔洞）。
-pub fn loops_to_path(loops: &[Vec<(f32, f32)>], eps: f32) -> String {
+/// 每个闭环会先尝试拟合成【圆】或【轴对齐椭圆】，命中则用弧命令（真圆/真椭圆），
+/// 否则回退多边形（L 命令）。弧与多边形可共存于同一 path，故孔洞(evenodd)仍成立。
+pub fn loops_to_path(
+    loops: &[Vec<(f32, f32)>],
+    eps: f32,
+    circ_tol: f32,
+    ell_tol: f32,
+) -> String {
     let mut s = String::new();
     for lp in loops {
-        let simp = simplify_polygon(lp, eps);
-        if simp.len() < 3 {
+        let sub = loop_to_subpath(lp, eps, circ_tol, ell_tol);
+        if sub.is_empty() {
             continue;
         }
-        s.push_str(&format!("M {} {}", simp[0].0, simp[0].1));
-        for p in &simp[1..] {
-            s.push_str(&format!(" L {} {}", p.0, p.1));
-        }
-        s.push_str(" Z");
+        s.push_str(&sub);
     }
+    s
+}
+
+// ---------------- 图元拟合（圆 / 椭圆） ----------------
+
+fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let mut a = m;
+    let mut c = b;
+    for col in 0..3 {
+        let mut piv = col;
+        let mut best = a[col][col].abs();
+        for r in col + 1..3 {
+            let v = a[r][col].abs();
+            if v > best {
+                best = v;
+                piv = r;
+            }
+        }
+        if best < 1e-12 {
+            return None;
+        }
+        if piv != col {
+            a.swap(col, piv);
+            c.swap(col, piv);
+        }
+        let d = a[col][col];
+        for r in col + 1..3 {
+            let f = a[r][col] / d;
+            for k in col..3 {
+                a[r][k] -= f * a[col][k];
+            }
+            c[r] -= f * c[col];
+        }
+    }
+    let mut x = [0f64; 3];
+    for i in (0..3).rev() {
+        let mut s = c[i];
+        for j in i + 1..3 {
+            s -= a[i][j] * x[j];
+        }
+        x[i] = s / a[i][i];
+    }
+    Some(x)
+}
+
+fn solve2(m: [[f64; 2]; 2], b: [f64; 2]) -> Option<[f64; 2]> {
+    let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    Some([
+        (m[1][1] * b[0] - m[0][1] * b[1]) / det,
+        (m[0][0] * b[1] - m[1][0] * b[0]) / det,
+    ])
+}
+
+/// 最小二乘圆拟合（Pratt 归一化，降低半径偏差）。返回 (cx, cy, r, rmse)。
+fn fit_circle(pts: &[(f32, f32)]) -> Option<(f32, f32, f32, f32)> {
+    if pts.len() < 5 {
+        return None;
+    }
+    let mut ata = [[0f64; 3]; 3];
+    let mut atb = [0f64; 3];
+    for &(x, y) in pts {
+        let x = x as f64;
+        let y = y as f64;
+        let z = x * x + y * y;
+        let zn = z.sqrt().max(1e-9);
+        let row = [x / zn, y / zn, 1.0 / zn];
+        let rhs = (-z) / zn;
+        for i in 0..3 {
+            for j in 0..3 {
+                ata[i][j] += row[i] * row[j];
+            }
+            atb[i] += row[i] * rhs;
+        }
+    }
+    let sol = solve3(ata, atb)?;
+    let (aa, bb, cc) = (sol[0], sol[1], sol[2]);
+    let cx = -aa / 2.0;
+    let cy = -bb / 2.0;
+    let r2 = cx * cx + cy * cy - cc;
+    if r2 <= 0.0 || !r2.is_finite() {
+        return None;
+    }
+    let r = r2.sqrt();
+    if r <= 0.0 {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mut se = 0.0;
+    for &(x, y) in pts {
+        let d = ((x as f64 - cx).hypot(y as f64 - cy) - r).abs();
+        se += d * d;
+    }
+    let rmse = (se / n).sqrt();
+    Some((cx as f32, cy as f32, r as f32, rmse as f32))
+}
+
+/// 给定圆心，最小二乘轴对齐椭圆拟合 (xi-cx)²/rx² + (yi-cy)²/ry² = 1。
+/// 令 u=1/rx², v=1/ry²，方程变为 u·A + v·B = 1（对 u,v 线性）。返回 (cx, cy, rx, ry, rmse)。
+fn fit_axis_ellipse(
+    pts: &[(f32, f32)],
+    cx: f64,
+    cy: f64,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    if pts.len() < 5 {
+        return None;
+    }
+    let mut ata = [[0f64; 2]; 2];
+    let mut atb = [0f64; 2];
+    for &(x, y) in pts {
+        let dx = x as f64 - cx;
+        let dy = y as f64 - cy;
+        let a = dx * dx;
+        let b = dy * dy;
+        ata[0][0] += a * a;
+        ata[0][1] += a * b;
+        ata[1][0] += a * b;
+        ata[1][1] += b * b;
+        atb[0] += a;
+        atb[1] += b;
+    }
+    let sol = solve2(ata, atb)?;
+    let (u, v) = (sol[0], sol[1]);
+    if u <= 0.0 || v <= 0.0 {
+        return None;
+    }
+    let rx = 1.0 / u.sqrt();
+    let ry = 1.0 / v.sqrt();
+    if !rx.is_finite() || !ry.is_finite() {
+        return None;
+    }
+    let n = pts.len() as f64;
+    let mut se = 0.0;
+    for &(x, y) in pts {
+        let dx = x as f64 - cx;
+        let dy = y as f64 - cy;
+        let val = (dx * dx / (rx * rx) + dy * dy / (ry * ry)).sqrt();
+        se += (val - 1.0).powi(2);
+    }
+    let rmse = (se / n).sqrt();
+    Some((cx as f32, cy as f32, rx as f32, ry as f32, rmse as f32))
+}
+
+fn centroid(pts: &[(f32, f32)]) -> (f64, f64) {
+    let (mut sx, mut sy) = (0.0, 0.0);
+    for &(x, y) in pts {
+        sx += x as f64;
+        sy += y as f64;
+    }
+    let n = pts.len() as f64;
+    (sx / n, sy / n)
+}
+
+fn circle_subpath(cx: f32, cy: f32, r: f32) -> String {
+    format!(
+        "M {} {} A {} {} 0 0 1 {} {} A {} {} 0 0 1 {} {} Z",
+        cx - r, cy, r, r, cx + r, cy, r, r, cx - r, cy
+    )
+}
+
+fn ellipse_subpath(cx: f32, cy: f32, rx: f32, ry: f32) -> String {
+    format!(
+        "M {} {} A {} {} 0 0 1 {} {} A {} {} 0 0 1 {} {} Z",
+        cx - rx, cy, rx, ry, cx + rx, cy, rx, ry, cx - rx, cy
+    )
+}
+
+/// 把一个闭环渲染成 SVG 子路径：圆 → 弧；轴对齐椭圆 → 弧；否则回退多边形。
+fn loop_to_subpath(loop_: &[(f32, f32)], eps: f32, circ_tol: f32, ell_tol: f32) -> String {
+    if loop_.len() >= 5 {
+        // 先试圆
+        if let Some((cx, cy, r, res)) = fit_circle(loop_) {
+            if r > 0.5 && res / r < circ_tol {
+                return circle_subpath(cx, cy, r);
+            }
+        }
+        // 再试椭圆：用质心作为椭圆中心（细长椭圆的圆拟合中心会偏移，不可信）
+        let (mx, my) = centroid(loop_);
+        if let Some((_, _, rx, ry, eres)) = fit_axis_ellipse(loop_, mx, my) {
+            if rx > 0.5
+                && ry > 0.5
+                && eres < ell_tol
+                && (rx / ry) < 12.0
+                && (ry / rx) < 12.0
+            {
+                return ellipse_subpath(mx as f32, my as f32, rx, ry);
+            }
+        }
+    }
+    // 回退：多边形（RDP 简化）
+    let simp = simplify_polygon(loop_, eps);
+    if simp.len() < 3 {
+        return String::new();
+    }
+    let mut s = format!("M {} {}", simp[0].0, simp[0].1);
+    for p in &simp[1..] {
+        s.push_str(&format!(" L {} {}", p.0, p.1));
+    }
+    s.push_str(" Z");
     s
 }
