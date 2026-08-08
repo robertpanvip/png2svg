@@ -319,17 +319,20 @@ pub fn simplify_polygon(points: &[(f32, f32)], eps: f32) -> Vec<(f32, f32)> {
 }
 
 /// 把若干闭环拼成一个 SVG path（用 fill-rule=evenodd 时，第二环起为孔洞）。
-/// 每个闭环会先尝试拟合成【圆】或【轴对齐椭圆】，命中则用弧命令（真圆/真椭圆），
-/// 否则回退多边形（L 命令）。弧与多边形可共存于同一 path，故孔洞(evenodd)仍成立。
+/// 每个闭环会先尝试拟合成【圆】或【轴对齐椭圆】，命中则用弧命令（真圆/真椭圆）；
+/// 否则回退：若允许平滑且点数较多（曲线型轮廓），用 Catmull-Rom 样条生成平滑
+/// 密集曲线（C 命令）；否则保留多边形（L 命令）。弧/曲线/多边形可共存于同一 path，
+/// 故孔洞(evenodd)仍成立。
 pub fn loops_to_path(
     loops: &[Vec<(f32, f32)>],
     eps: f32,
     circ_tol: f32,
     ell_tol: f32,
+    smooth: bool,
 ) -> String {
     let mut s = String::new();
     for lp in loops {
-        let sub = loop_to_subpath(lp, eps, circ_tol, ell_tol);
+        let sub = loop_to_subpath(lp, eps, circ_tol, ell_tol, smooth);
         if sub.is_empty() {
             continue;
         }
@@ -504,8 +507,16 @@ fn ellipse_subpath(cx: f32, cy: f32, rx: f32, ry: f32) -> String {
     )
 }
 
-/// 把一个闭环渲染成 SVG 子路径：圆 → 弧；轴对齐椭圆 → 弧；否则回退多边形。
-fn loop_to_subpath(loop_: &[(f32, f32)], eps: f32, circ_tol: f32, ell_tol: f32) -> String {
+/// 把一个闭环渲染成 SVG 子路径：圆 → 弧；轴对齐椭圆 → 弧；否则回退。
+/// 回退时：若 smooth 且点数较多，则用 Catmull-Rom 平滑曲线（高密度、平滑）；
+/// 否则保留多边形。
+fn loop_to_subpath(
+    loop_: &[(f32, f32)],
+    eps: f32,
+    circ_tol: f32,
+    ell_tol: f32,
+    smooth: bool,
+) -> String {
     if loop_.len() >= 5 {
         // 先试圆
         if let Some((cx, cy, r, res)) = fit_circle(loop_) {
@@ -526,14 +537,52 @@ fn loop_to_subpath(loop_: &[(f32, f32)], eps: f32, circ_tol: f32, ell_tol: f32) 
             }
         }
     }
-    // 回退：多边形（RDP 简化）
+    // 回退：先 RDP 简化（保留细节用于最终曲线）
     let simp = simplify_polygon(loop_, eps);
     if simp.len() < 3 {
         return String::new();
     }
+    // 贝塞尔曲线检测：粗简化（压平像素台阶）后，若轮廓仍需很多段才能表示（>12），
+    // 说明它是处处弯曲的曲线（圆/椭圆/花瓣/云朵等），输出密集三次贝塞尔；
+    // 直线多边形（方块/星形/正多边形）粗化后只剩少数边（≤12），保持多边形、不磨角。
+    if smooth && simp.len() >= 8 {
+        // 贝塞尔曲线检测：粗简化（压平像素台阶）后，若轮廓仍需很多段才能表示（>12），
+        // 说明它是处处弯曲的曲线（圆/椭圆/花瓣/云朵等），输出密集三次贝塞尔；
+        // 直线多边形（方块/星形/正多边形）粗化后只剩少数边（≤12），保持多边形、不磨角。
+        let coarse = simplify_polygon(loop_, eps.max(3.0));
+        if coarse.len() > 12 {
+            return catmull_rom_path(&simp);
+        }
+    }
     let mut s = format!("M {} {}", simp[0].0, simp[0].1);
     for p in &simp[1..] {
         s.push_str(&format!(" L {} {}", p.0, p.1));
+    }
+    s.push_str(" Z");
+    s
+}
+
+/// 闭合 Catmull-Rom 样条 → 三次贝塞尔路径（tension=1 标准系数）。
+/// 经过所有控制点，在尖角处可能轻微过冲；因此只对曲线型轮廓使用（见 loop_to_subpath）。
+fn catmull_rom_path(pts: &[(f32, f32)]) -> String {
+    let n = pts.len();
+    if n < 3 {
+        return String::new();
+    }
+    let mut s = format!("M {} {}", pts[0].0, pts[0].1);
+    for i in 0..n {
+        let p0 = pts[(i + n - 1) % n];
+        let p1 = pts[i];
+        let p2 = pts[(i + 1) % n];
+        let p3 = pts[(i + 2) % n];
+        let c1x = p1.0 + (p2.0 - p0.0) / 6.0;
+        let c1y = p1.1 + (p2.1 - p0.1) / 6.0;
+        let c2x = p2.0 - (p3.0 - p1.0) / 6.0;
+        let c2y = p2.1 - (p3.1 - p1.1) / 6.0;
+        s.push_str(&format!(
+            " C {} {} {} {} {} {}",
+            c1x, c1y, c2x, c2y, p2.0, p2.1
+        ));
     }
     s.push_str(" Z");
     s

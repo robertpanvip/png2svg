@@ -46,6 +46,7 @@ struct Opts {
     simplify: f32,
     circ_tol: f32,
     ell_tol: f32,
+    smooth: bool,
 }
 
 fn main() {
@@ -92,7 +93,13 @@ fn main() {
     let mut items: Vec<(u8, String, gradient::Fit, f32)> = Vec::new();
     for reg in &regions {
         let loops = contour::trace_with_holes(&reg.mask, w, h);
-        let d = contour::loops_to_path(&loops, opts.simplify, opts.circ_tol, opts.ell_tol);
+        let d = contour::loops_to_path(
+            &loops,
+            opts.simplify,
+            opts.circ_tol,
+            opts.ell_tol,
+            opts.smooth,
+        );
         if d.is_empty() {
             continue;
         }
@@ -181,9 +188,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         shadow_alpha: 230.0,
         solid_eps: 8.0,
         r2_thresh: 0.6,
-        simplify: 1.0,
+        simplify: 0.5,
         circ_tol: 0.06,
         ell_tol: 0.06,
+        smooth: true,
     };
     let mut i = 1;
     while i < args.len() {
@@ -233,6 +241,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 opts.ell_tol = next_f32(args, i)?;
                 i += 2;
             }
+            "--no-smooth" => {
+                opts.smooth = false;
+                i += 1;
+            }
             s if !s.starts_with('-') => {
                 if opts.input.is_empty() {
                     opts.input = s.to_string();
@@ -271,7 +283,8 @@ fn print_usage() {
   --invert           无 alpha 时翻转前景/背景\n\
   --solid-eps N      判定为渐变的最小整片颜色变化量（默认 8）\n\
   --r2 N             判定为渐变的最小 R²（默认 0.6）\n\
-  --simplify N       轮廓简化精度（默认 1.0）\n\
+  --simplify N       轮廓简化精度（默认 0.5，越小点越密）\n\
+  --no-smooth        关闭曲线平滑，回退为纯多边形（配合小 --simplify 可得极密多边形）\n\
   --circ-tol N       圆拟合容许误差/半径（默认 0.06，越小越严格）\n\
   --ell-tol N        椭圆拟合容许误差（默认 0.06，越小越严格）"
     );
