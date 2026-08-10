@@ -199,11 +199,11 @@ def write_report(rows):
         body.append(td(f"{r['alpha']:.2f}"))
         body.append(td(f"{r['ssim']:.4f}"))
         body.append(f"<td style='color:{color};font-weight:bold'>{r['status']}</td>")
-        body.append(f"<td><img src='in/{n}.png' width='110'/></td>")
-        body.append(f"<td><img src='out/{n}_rec.png' width='110'/></td>")
-        body.append(f"<td><img src='out/{n}_diff.png' width='110'/></td>")
+        body.append(f"<td><img src='../in/{n}.png' width='110'/></td>")
+        body.append(f"<td><img src='{n}_rec.png' width='110'/></td>")
+        body.append(f"<td><img src='{n}_diff.png' width='110'/></td>")
         # svg path text (collapse, show first 600 chars)
-        svg_path = f"out/{n}.svg"
+        svg_path = f"{n}.svg"
         body.append(f"<td><a href='{svg_path}'>svg</a></td>")
         body.append("</tr>")
     body.append("</table>")
