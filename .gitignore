@@ -20,3 +20,4 @@ Thumbs.db
 
 # icon 还原测试生成的产物
 tests/gen_icons/out
+tmp_refchk/
