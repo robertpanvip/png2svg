@@ -608,6 +608,65 @@ fn fit_circle_3pt(a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> Option<((f64, 
     Some(((ux, uy), r))
 }
 
+/// 对一组点做**最小二乘圆拟合**（Kåsa 法）：解 x²+y² + A·x + B·y + C = 0。
+/// 与三点定圆相比，它对栅格化整数噪声鲁棒得多——三点法在弧跨度小时会因 ±0.2px 扰动
+/// 把半径算飞（如圆角 r=42 被算成 29），而 LS 用全部点平均掉噪声，半径稳定准确。
+/// 返回 (cx, cy, r)。半径超出 [1, 400] 或退化（近直线 r→∞）返回 None。
+fn fit_circle_ls(run: &[(f32, f32)]) -> Option<(f64, f64, f64)> {
+    let n = run.len();
+    if n < 6 {
+        return None;
+    }
+    let nf = n as f64;
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut sxx = 0.0f64;
+    let mut sxy = 0.0f64;
+    let mut syy = 0.0f64;
+    let mut sxxx = 0.0f64;
+    let mut sxxy = 0.0f64;
+    let mut sxyy = 0.0f64;
+    let mut syyy = 0.0f64;
+    let mut sx2y2 = 0.0f64;
+    for p in run {
+        let x = p.0 as f64;
+        let y = p.1 as f64;
+        let x2 = x * x;
+        let y2 = y * y;
+        sx += x;
+        sy += y;
+        sxx += x2;
+        sxy += x * y;
+        syy += y2;
+        sxxx += x2 * x;
+        sxxy += x2 * y;
+        sxyy += x * y2;
+        syyy += y2 * y;
+        sx2y2 += x2 + y2;
+    }
+    let m = [
+        [sxx, sxy, sx],
+        [sxy, syy, sy],
+        [sx, sy, nf],
+    ];
+    let rhs = [-(sxxx + sxyy), -(sxxy + syyy), -sx2y2];
+    let sol = solve3(m, rhs)?;
+    let a = sol[0];
+    let b = sol[1];
+    let c = sol[2];
+    let cx = -a / 2.0;
+    let cy = -b / 2.0;
+    let r2 = cx * cx + cy * cy - c;
+    if r2 <= 0.0 {
+        return None;
+    }
+    let r = r2.sqrt();
+    if !r.is_finite() || r < 1.0 || r > 400.0 {
+        return None;
+    }
+    Some((cx, cy, r))
+}
+
 #[inline]
 fn angle_of(p: (f32, f32), cx: f64, cy: f64) -> f64 {
     (p.1 as f64 - cy).atan2(p.0 as f64 - cx)
@@ -625,26 +684,12 @@ fn fit_and_validate_arc(
     _line_eps: f32,
 ) -> Option<(f64, f64, f64, f64, f32)> {
     if run.len() < 8 {
-        return None; // 窗口太短，三点定圆不稳定，延后到更长窗口再判
+        return None; // 窗口太短，最小二乘拟合样本不足
     }
-    let (pa, pb) = (run[0], run[run.len() - 1]);
-    let mut apex = 0usize;
-    let mut bmax = -1.0f32;
-    for q in 1..run.len() - 1 {
-        let d = point_line_dist(run[q], pa, pb);
-        if d > bmax {
-            bmax = d;
-            apex = q;
-        }
-    }
-    // 窗口半宽自适应：小圆角(短运行)自动缩窗口留在弧段内，避免把整角+直边一并拟合导致失败；
-    // 大圆则放大到 ~25° 跨度以稳定恢复半径（细采样大圆上过短的窗口近乎直线→半径巨大被拒）。
-    let maxw = std::cmp::min(apex, run.len() - 1 - apex);
-    let target = std::cmp::max(3usize, (run.len() / 4).min(15));
-    let w = std::cmp::min(maxw, target);
-    let ((ccx, ccy), rr) = fit_circle_3pt(run[apex - w], run[apex], run[apex + w])?;
-    if rr < 1.0 || rr > 200.0 {
-        return None; // 半径过大（近直边）或过小，拒掉
+    // 最小二乘圆拟合（全窗口），对栅格化噪声鲁棒，半径准确。
+    let (ccx, ccy, rr) = fit_circle_ls(run)?;
+    if rr < 1.0 || rr > 300.0 {
+        return None; // 半径过大（近直边 r→∞）或过小，拒掉
     }
     let mut prev = angle_of(run[0], ccx, ccy);
     let mut dir = 0i32;
@@ -679,7 +724,6 @@ fn fit_and_validate_arc(
     if total.abs() > std::f64::consts::PI {
         return None;
     }
-    let _ = bmax; // 仅用于 apex 选择，不再作为“直/弧”判据（短窗口 bmax 恒小会误杀真弧）
     Some((ccx, ccy, rr, total, maxd as f32))
 }
 
