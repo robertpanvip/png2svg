@@ -1147,14 +1147,16 @@ fn loop_to_subpath(
             }
         }
         // 再试椭圆（含旋转）：PCA 估计主轴方向后做轴对齐椭圆拟合，命中则输出真椭圆弧
-        // （带 x-axis-rotation）。
+        // （带 x-axis-rotation）。门限同圆：核心看紧密拟合(eres<ell_tol)，corners_robust<3
+        // 作第二保险挡多边形；但 eres<0.015 是铁证椭圆（八边形 eres≈0.024 远高于此），
+        // 即便 AA 噪声把粗简化折角顶到 ≥3 也直接判椭圆，避免椭圆被碎成多段弧。
         if let Some((ecx, ecy, erx, ery, etheta, eres)) = fit_rotated_ellipse(loop_) {
             if erx > 0.5
                 && ery > 0.5
                 && eres < ell_tol
                 && (erx / ery) < 12.0
                 && (ery / erx) < 12.0
-                && corners_robust < 3
+                && (corners_robust < 3 || eres < 0.015)
             {
                 return rotated_ellipse_subpath(ecx, ecy, erx, ery, etheta);
             }

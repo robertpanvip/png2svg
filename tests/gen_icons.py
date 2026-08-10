@@ -12,6 +12,13 @@
   ic_play     圆 + 播放三角（圆 + 多边形）
   ic_check    圆角方块 + 对勾描边（圆角 + 折线）
   ic_cloud    云（多个椭圆合并，平滑 blob）
+  ic_ellipse  纯椭圆（测 fit_rotated_ellipse 分支）
+  ic_capsule  胶囊/体育场（2 半圆 + 2 直边，测弧-线-弧衔接）
+  ic_rhex     圆角六边形（直边 + 圆角，圆角多边形分支）
+  ic_pentagon 尖角正五边形（应锐利，不被圆化）
+  ic_drop     水滴（平滑曲线 + 1 尖点）
+  ic_chevron  双雪佛龙箭头（尖角多边形）
+  ic_rings3   三同心环
 
 绘制在 4x 超采样画布上，再 LANCZOS 下采样到 200x200 得到干净抗锯齿边缘。
 依赖：Pillow + numpy（通过 PYLIBS 注入）。
@@ -131,6 +138,82 @@ def _cloud(d, cx, cy):
         d.ellipse([q(ex - rx), q(ey - ry), q(ex + rx), q(ey + ry)], fill=255)
 
 
+def _ellipse(d, cx, cy, rx, ry):
+    d.ellipse([q(cx - rx), q(cy - ry), q(cx + rx), q(cy + ry)], fill=255)
+
+
+def _capsule(d, cx, cy, w, h):
+    # 胶囊/体育场形：圆角矩形，圆角半径 = 高/2（两端半圆 + 中间直边）。
+    d.rounded_rectangle([q(cx - w / 2), q(cy - h / 2), q(cx + w / 2), q(cy + h / 2)],
+                        radius=q(h / 2), fill=255)
+
+
+def _roundpoly(d, cx, cy, r_out, n, cr, rot=-math.pi / 2):
+    """圆角正 n 边形：每条边是直线，每个顶点用半径 cr 的外凸圆弧连接。"""
+    verts = []
+    for i in range(n):
+        a = rot + i * 2 * math.pi / n
+        verts.append((cx + r_out * math.cos(a), cy + r_out * math.sin(a)))
+    m = len(verts)
+    pts = []
+    for i in range(m):
+        p_prev = verts[(i - 1) % m]
+        p_cur = verts[i]
+        p_next = verts[(i + 1) % m]
+
+        def tpt(a, b):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L = math.hypot(dx, dy)
+            f = min(cr, L / 2 - 0.5)
+            return (a[0] + dx / L * f, a[1] + dy / L * f)
+
+        t1 = tpt(p_cur, p_prev)
+        t2 = tpt(p_cur, p_next)
+        a1 = math.atan2(t1[1] - p_cur[1], t1[0] - p_cur[0])
+        a2 = math.atan2(t2[1] - p_cur[1], t2[0] - p_cur[0])
+        da = a2 - a1
+        while da > math.pi:
+            da -= 2 * math.pi
+        while da < -math.pi:
+            da += 2 * math.pi
+        steps = max(2, int(abs(da) / 0.25) + 1)
+        for s in range(steps + 1):
+            a = a1 + da * s / steps
+            pts.append((p_cur[0] + cr * math.cos(a), p_cur[1] + cr * math.sin(a)))
+    d.polygon([(q(x), q(y)) for (x, y) in pts], fill=255)
+
+
+def _pentagon(d, cx, cy, r, rot=-math.pi / 2):
+    pts = []
+    for i in range(5):
+        a = rot + i * 2 * math.pi / 5
+        pts.append((q(cx + r * math.cos(a)), q(cy + r * math.sin(a))))
+    d.polygon(pts, fill=255)
+
+
+def _drop(d, cx, cy, r):
+    # 水滴：下半圆 + 上方尖角，平滑闭合曲线（1 个尖点）。
+    d.ellipse([q(cx - r), q(cy - r), q(cx + r), q(cy + r)], fill=255)
+    d.polygon([(q(cx - r * 0.5), q(cy - r * 0.2)),
+               (q(cx), q(cy - r * 1.8)),
+               (q(cx + r * 0.5), q(cy - r * 0.2))], fill=255)
+
+
+def _chevron(d, cx, cy, s):
+    # 双雪佛龙箭头（尖角多边形，应保持锐利不被圆化）。
+    d.polygon([(q(cx - s), q(cy - s * 0.5)), (q(cx), q(cy - s)),
+               (q(cx + s), q(cy - s * 0.5)), (q(cx + s * 0.4), q(cy)),
+               (q(cx + s), q(cy + s * 0.5)), (q(cx), q(cy + s)),
+               (q(cx - s), q(cy + s * 0.5)), (q(cx - s * 0.4), q(cy))], fill=255)
+
+
+def _rings(d, cx, cy, rs):
+    # 同心环：每环 = 白盘 - 内黑盘。
+    for r in rs:
+        d.ellipse([q(cx - r), q(cy - r), q(cx + r), q(cy + r)], fill=255)
+        d.ellipse([q(cx - r + 10), q(cy - r + 10), q(cx + r - 10), q(cy + r - 10)], fill=0)
+
+
 def build():
     imgs = {}
 
@@ -204,6 +287,41 @@ def build():
     c = canvas()
     c = add(c, lambda d: _cloud(d, 100, 100), (236, 240, 241, 255))
     imgs["ic_cloud"] = c
+
+    # 11) ic_ellipse —— 纯椭圆（无旋转，测 fit_rotated_ellipse 分支）
+    c = canvas()
+    c = add(c, lambda d: _ellipse(d, 100, 100, 82, 52), (155, 89, 182, 255))
+    imgs["ic_ellipse"] = c
+
+    # 12) ic_capsule —— 胶囊/体育场形（2 半圆 + 2 直边，测弧-线-弧干净衔接）
+    c = canvas()
+    c = add(c, lambda d: _capsule(d, 100, 100, 150, 80), (52, 152, 219, 255))
+    imgs["ic_capsule"] = c
+
+    # 13) ic_rhex —— 圆角六边形（直边 + 圆角，测圆角多边形分支）
+    c = canvas()
+    c = add(c, lambda d: _roundpoly(d, 100, 100, 82, 6, 22), (241, 196, 15, 255))
+    imgs["ic_rhex"] = c
+
+    # 14) ic_pentagon —— 尖角正五边形（多边形，应保持锐利）
+    c = canvas()
+    c = add(c, lambda d: _pentagon(d, 100, 100, 84), (231, 76, 60, 255))
+    imgs["ic_pentagon"] = c
+
+    # 15) ic_drop —— 水滴（平滑曲线 + 1 尖点）
+    c = canvas()
+    c = add(c, lambda d: _drop(d, 100, 108, 60), (230, 126, 34, 255))
+    imgs["ic_drop"] = c
+
+    # 16) ic_chevron —— 双雪佛龙箭头（尖角多边形）
+    c = canvas()
+    c = add(c, lambda d: _chevron(d, 100, 100, 44), (46, 204, 113, 255))
+    imgs["ic_chevron"] = c
+
+    # 17) ic_rings3 —— 三同心环
+    c = canvas()
+    c = add(c, lambda d: _rings(d, 100, 100, [80, 55, 30]), (149, 165, 166, 255))
+    imgs["ic_rings3"] = c
 
     for name, im in imgs.items():
         out = im.resize((N, N), Image.LANCZOS)

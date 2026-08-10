@@ -17,3 +17,6 @@ Thumbs.db
 # 测试依赖（pip --target 安装的 numpy/pillow，沙箱内路径易失效）与往返测试产物
 /tests/pylibs
 /tests/out
+
+# icon 还原测试生成的产物
+tests/gen_icons/out
