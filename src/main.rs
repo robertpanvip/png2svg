@@ -208,7 +208,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         solid_eps: 8.0,
         r2_thresh: 0.6,
         simplify: 0.5,
-        circ_tol: 0.06,
+        circ_tol: 0.025,
         ell_tol: 0.06,
         smooth: true,
     };
