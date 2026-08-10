@@ -332,6 +332,22 @@ pub fn loops_to_path(
 ) -> String {
     let mut s = String::new();
     for lp in loops {
+        // 跳过 1~2px 的孤立噪点/碎环（抗锯齿偶尔产生的单像素碎片），避免输出 0 面积 sliver。
+        if lp.len() >= 1 {
+            let mut minx = f32::MAX;
+            let mut miny = f32::MAX;
+            let mut maxx = f32::MIN;
+            let mut maxy = f32::MIN;
+            for &(x, y) in lp {
+                if x < minx { minx = x; }
+                if y < miny { miny = y; }
+                if x > maxx { maxx = x; }
+                if y > maxy { maxy = y; }
+            }
+            if (maxx - minx) < 2.0 && (maxy - miny) < 2.0 {
+                continue;
+            }
+        }
         let sub = loop_to_subpath(lp, eps, circ_tol, ell_tol, smooth);
         if sub.is_empty() {
             continue;
@@ -1081,16 +1097,17 @@ fn loop_to_subpath(
     if simp.len() < 3 {
         return String::new();
     }
-    // 角点计数：把多边形（八边形/方块/星/三角）可靠地挡在圆/椭圆分支之外。
-    // 多边形至少有 3 个明显折角（|转角| > 0.3rad≈17°）；圆/椭圆/平滑 blob 折角为 0。
-    // 仅看拟合残差会误判：八边形残差~0.024 与真圆~0.004 只差几倍，且曲线 blob 残差~0.031
-    // 也接近圆；但多边形“有折角”这一几何特征与圆/椭圆泾渭分明。
-    let m = simp.len();
+    // 粗简化轮廓：用于“稳健折角计数”。细简化(eps≈0.5px)对 200px 图标几乎不简化，
+    // 抗锯齿台阶被全部保留，导致每个顶点都像“折角”；粗简化(eps≥3px)抹平台阶、
+    // 只保留几何特征点，真圆/椭圆/平滑 blob 折角≈0，多边形保留真实折角。
+    let simp_c = simplify_polygon(loop_, eps.max(3.0));
+    // 角点计数（0.3rad≈17°）：用于贝塞尔门限，区分“平滑 blob”与“多边形”。
+    let m = simp_c.len();
     let mut corners = 0usize;
     for k in 0..m {
-        let a = simp[(k + m - 1) % m];
-        let b = simp[k];
-        let c = simp[(k + 1) % m];
+        let a = simp_c[(k + m - 1) % m];
+        let b = simp_c[k];
+        let c = simp_c[(k + 1) % m];
         let v1 = (b.0 as f64 - a.0 as f64, b.1 as f64 - a.1 as f64);
         let v2 = (c.0 as f64 - b.0 as f64, c.1 as f64 - b.1 as f64);
         let cross = v1.0 * v2.1 - v1.1 * v2.0;
@@ -1099,12 +1116,33 @@ fn loop_to_subpath(
             corners += 1;
         }
     }
-    // 圆/椭圆判定：要求“无折角”且“紧密拟合”。折角计数负责挡掉多边形；circ_tol/ell_tol
-    // 负责把曲线 blob（残差偏大）挡在圆/椭圆之外。
-    if loop_.len() >= 5 && corners < 3 {
-        // 先试圆。
+    // 噪声稳健折角计数（0.5rad≈29°）：粗简化后真多边形几何折角均 >0.5rad，平滑
+    // 圆/椭圆即便有残余台阶也 <0.5rad。与圆/椭圆拟合残差联合，可靠区分
+    // “真圆(res/r≈0.004, 折角≈0)”与“八边形(res/r≈0.024, 折角=8)”。
+    let mut corners_robust = 0usize;
+    for k in 0..m {
+        let a = simp_c[(k + m - 1) % m];
+        let b = simp_c[k];
+        let c = simp_c[(k + 1) % m];
+        let v1 = (b.0 as f64 - a.0 as f64, b.1 as f64 - a.1 as f64);
+        let v2 = (c.0 as f64 - b.0 as f64, c.1 as f64 - b.1 as f64);
+        let cross = v1.0 * v2.1 - v1.1 * v2.0;
+        let dot = v1.0 * v2.0 + v1.1 * v2.1;
+        if cross.atan2(dot).abs() > 0.5 {
+            corners_robust += 1;
+        }
+    }
+    // 圆/椭圆判定：核心判据是“紧密拟合”(res/r < circ_tol / ell_tol)，噪声稳健折角计数
+    // 仅作为第二道保险挡掉多边形。八边形 res/r≈0.024 接近圆但仍能凭 8 个大折角被挡掉；
+    // 真圆 res/r≈0.004~0.011、伪折角 <0.5rad → 通过，输出 2 段干净弧而非被碎成多段。
+    if loop_.len() >= 5 {
+        // 先试圆。判定：紧密拟合(res/r < circ_tol) 且不是清晰多边形。
+        // 清晰的几何多边形由“噪声稳健折角计数”挡掉；但对 res/r 极小(<0.013)的轮廓，
+        // 它已是铁证的圆/近圆（八边形 res/r≈0.024 远高于此），即便抗锯齿噪声把折角
+        // 计数顶到 ≥3 也直接判圆，避免小圆/内孔被碎成多段弧。
         if let Some((cx, cy, r, res)) = fit_circle(loop_) {
-            if r > 0.5 && (res as f64) / (r as f64) < circ_tol as f64 {
+            let rr = (res as f64) / (r as f64);
+            if r > 0.5 && rr < circ_tol as f64 && (corners_robust < 3 || rr < 0.013) {
                 return circle_subpath(cx, cy, r);
             }
         }
@@ -1116,6 +1154,7 @@ fn loop_to_subpath(
                 && eres < ell_tol
                 && (erx / ery) < 12.0
                 && (ery / erx) < 12.0
+                && corners_robust < 3
             {
                 return rotated_ellipse_subpath(ecx, ecy, erx, ery, etheta);
             }
