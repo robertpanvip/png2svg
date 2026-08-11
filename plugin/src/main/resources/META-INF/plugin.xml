@@ -20,7 +20,8 @@
                 id="com.pan.png2svg.idea.ConvertToSvgAction"
                 class="com.pan.png2svg.idea.ConvertToSvgAction"
                 text="Convert to SVG"
-                description="使用 png2svg 将选中的 PNG 转换为矢量 SVG">
+                description="使用 png2svg 将选中的 PNG 转换为矢量 SVG"
+                icon="/icons/png2svg.svg">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
             <add-to-group group-id="EditorTabPopupMenu" anchor="last"/>
         </action>

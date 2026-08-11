@@ -70,4 +70,9 @@ tasks {
     test {
         useJUnit()
     }
+
+    // 打包产物命名为 png2svg.zip（覆盖默认的 <projectName>-<version>.zip）
+    buildPlugin {
+        archiveFileName.set("png2svg.zip")
+    }
 }
