@@ -5,7 +5,7 @@
 //! - 无透明通道（被压平的背景图）时，用图像四条边的平均色作为背景色，
 //!   再用每个像素与背景的颜色距离来区分前景，避免“亮色图形在白底上”被误判。
 
-use image::{DynamicImage, GenericImageView};
+use image::DynamicImage;
 
 pub struct Raster {
     pub width: u32,

@@ -195,36 +195,3 @@ pub fn trace_with_holes(mask: &[bool], w: u32, h: u32) -> Vec<Vec<(f32, f32)>> {
     }
     loops
 }
-
-/// 提取所有 4 连通前景分量，每个返回独立掩码。
-pub fn components(mask: &[bool], w: u32, h: u32) -> Vec<Vec<bool>> {
-    let n = mask.len();
-    let mut visited = vec![false; n];
-    let mut comps = Vec::new();
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y * w + x) as usize;
-            if !mask[i] || visited[i] {
-                continue;
-            }
-            let mut cmask = vec![false; n];
-            let mut stack = vec![(x, y)];
-            while let Some((cx, cy)) = stack.pop() {
-                let ci = (cy * w + cx) as usize;
-                if visited[ci] || !mask[ci] {
-                    continue;
-                }
-                visited[ci] = true;
-                cmask[ci] = true;
-                for (nx, ny) in four_neighbors(cx, cy, w, h) {
-                    let ni = (ny * w + nx) as usize;
-                    if !visited[ni] && mask[ni] {
-                        stack.push((nx, ny));
-                    }
-                }
-            }
-            comps.push(cmask);
-        }
-    }
-    comps
-}

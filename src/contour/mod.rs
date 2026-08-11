@@ -81,7 +81,6 @@ fn loop_to_subpath(
     ell_tol: f32,
     smooth: bool,
 ) -> String {
-    let line_eps = if eps < 1.0 { 1.0 } else { eps };
     let simp = simplify_polygon(loop_, eps);
     if simp.len() < 3 {
         return String::new();

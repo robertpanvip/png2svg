@@ -168,14 +168,8 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
     let mut sby = 0.0;
     let mut tb = 0.0;
     // 每通道：双线性 RHS（Σ x'·dc, Σ y'·dc, Σ x'y'·dc）
-    let mut srx2y_r = 0.0;
-    let mut sry2_r = 0.0;
     let mut srxy_r = 0.0;
-    let mut srx2y_g = 0.0;
-    let mut sry2_g = 0.0;
     let mut srxy_g = 0.0;
-    let mut srx2y_b = 0.0;
-    let mut sry2_b = 0.0;
     let mut srxy_b = 0.0;
 
     // 包围盒（网格渲染用）+ 各通道颜色极值（方向无关的“整片颜色变化量”门限）
@@ -213,14 +207,8 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         sby += yp * db;
         tb += db * db;
 
-        srx2y_r += xp * xp * yp * dr;
-        sry2_r += xp * yp * yp * dr;
         srxy_r += xp * yp * dr;
-        srx2y_g += xp * xp * yp * dg;
-        sry2_g += xp * yp * yp * dg;
         srxy_g += xp * yp * dg;
-        srx2y_b += xp * xp * yp * db;
-        sry2_b += xp * yp * yp * db;
         srxy_b += xp * yp * db;
 
         if (x as f64) < minx {
