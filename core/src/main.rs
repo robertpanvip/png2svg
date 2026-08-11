@@ -1,16 +1,15 @@
 //! png2svg —— 面向 icon 的 PNG→SVG 转换工具。
 //!
-//! 设计（按“靠颜色区分轮廓”）：
-//!   - 轮廓不是单独二值化得到的，而是【每个彩色区域的边界】——区域之间靠
-//!     颜色 / alpha 差异自然分开，边界即轮廓。
-//!   - 每个区域再被识别为三类之一：
-//!        * 纯色（Solid）        —— 颜色近似恒定；
-//!        * 渐变（Gradient）     —— 颜色随位置变化；细分为三类：
-//!                               线性渐变（平面，拟合 R² 高）/ 径向渐变（颜色随半径变化）/
-//!                               网格渐变（双线性四角场，单一方向无法表示）；
-//!        * 阴影（Shadow）       —— 半透明（平均 alpha 偏低），渲染时降低不透明度，
-//!                                  并画在底层，模拟投影。
-//!   识别顺序：先判阴影（alpha），再判渐变，最后兜底纯色。
+//! 设计（轮廓由“成熟黑白轮廓识别”得到，渐变/阴影沿用原有平滑拟合）：
+//!   1. 先用洪泛分割（segment）把图像分成区域，仅用来识别【渐变 / 阴影】两类：
+//!        * 渐变（Gradient）—— 颜色随位置平滑变化，细分为线性 / 径向 / 网格；
+//!        * 阴影（Shadow）  —— 半透明（平均 alpha 偏低），降低不透明度画在底层。
+//!      这两类的像素会被标记为 claimed，不参与纯色步骤。
+//!   2. 纯色采用“成熟黑白轮廓识别”：把前景里未被渐变/阴影占用的像素，按颜色
+//!      范围（color_tol）聚成若干调色板颜色；每种颜色生成一张黑白掩码
+//!      （该颜色=黑、其余=白），描出轮廓后填该色，把所有颜色的结果叠加，
+//!      即得到完整、干净的彩色轮廓。这样同一颜色的相邻碎块会自动合并成
+//!      一个轮廓，避免逐区域描边产生的碎片与幽灵圆。
 //!
 //! 用法：
 //!   png2svg input.png -o out.svg
@@ -49,6 +48,8 @@ struct Opts {
     circ_tol: f32,
     ell_tol: f32,
     smooth: bool,
+    /// 纯色按颜色范围聚类的容差（即“颜色范围”的粗细）
+    color_tol: f32,
 }
 
 fn main() {
@@ -84,27 +85,22 @@ fn main() {
 
     let mut builder = svg::SvgBuilder::new(w, h);
 
-    // Step A：按颜色 + alpha 分割区域
+    // Step A：分割 + 识别。渐变 / 阴影区域沿用原有的平滑拟合渲染
+    // （“以前的渐变 这些保留”），并把它们的像素标记为 claimed，避免下一步
+    // 被当作纯色重复渲染。纯色区域此处不参与渲染。
     let regions = segment::segment(&raster, &fg, opts.tolerance, ALPHA_W);
     let params = FitParams {
         min_var: opts.solid_eps,
         r2_thresh: opts.r2_thresh,
     };
+    let n = (w * h) as usize;
+    let mut claimed = vec![false; n];
 
-    // Step B：识别每一块是 纯色 / 渐变 / 阴影，并记录几何
-    let mut items: Vec<(u8, String, gradient::Fit, f32)> = Vec::new();
+    // 阴影画在最底层、渐变在中间层；纯色在 Step B 单独处理。
+    let mut shadows: Vec<(String, gradient::Fit, f32)> = Vec::new();
+    let mut gradients: Vec<(String, gradient::Fit)> = Vec::new();
+
     for reg in &regions {
-        let loops = contour::trace_with_holes(&reg.mask, w, h);
-        let d = contour::loops_to_path(
-            &loops,
-            opts.simplify,
-            opts.circ_tol,
-            opts.ell_tol,
-            opts.smooth,
-        );
-        if d.is_empty() {
-            continue;
-        }
         let avg_a = reg.samples.iter().map(|&(_, _, _, _, _, a)| a as f32).sum::<f32>()
             / reg.samples.len() as f32;
         let f = fit(&reg.samples, &params);
@@ -116,7 +112,7 @@ fn main() {
             KIND_SOLID
         };
 
-        // 区域包围盒（诊断 + 细长效验）
+        // 区域包围盒（细长条效验，丢弃近直线边缘的抗锯齿像素，消除幽灵圆）
         let (mut bx0, mut by0, mut bx1, mut by1) =
             (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for &(x, y, _, _, _, _) in &reg.samples {
@@ -140,72 +136,115 @@ fn main() {
         } else {
             f32::MAX
         };
-        if std::env::var("PNG2SVG_DEBUG").is_ok() {
-            eprintln!(
-                "[dbg] n={} avg_a={:.1} kind={} bbox=({:.1},{:.1})-({:.1},{:.1}) aspect={:.1}",
-                reg.samples.len(),
-                avg_a,
-                kind,
-                bx0,
-                by0,
-                bx1,
-                by1,
-                aspect
-            );
-        }
-
-        // 细长条（近直线边缘的抗锯齿像素）会被洪泛分割出来、误判为阴影，
-        // 因近直线段圆拟合半径被放大成巨大圆，渲染出淡大圆光晕。这类像素本就是
-        // 相邻实色形状的边界，直接丢弃（不渲染），既消除光晕也不损失形状信息。
         if kind == KIND_SHADOW && aspect > 5.0 {
             continue;
         }
 
-        items.push((kind, d, f, avg_a));
+        // 纯色区域不参与此处渲染，交给 Step B 的“按颜色量化”统一处理。
+        if kind == KIND_SOLID {
+            continue;
+        }
+
+        let loops = contour::trace_with_holes(&reg.mask, w, h);
+        let d = contour::loops_to_path(
+            &loops,
+            opts.simplify,
+            opts.circ_tol,
+            opts.ell_tol,
+            opts.smooth,
+        );
+        if d.is_empty() {
+            continue;
+        }
+        if kind == KIND_SHADOW {
+            shadows.push((d, f, (avg_a / 255.0).clamp(0.0, 1.0)));
+        } else {
+            gradients.push((d, f));
+        }
+        // 标记为 claimed，纯色步骤不再触碰这些像素
+        for i in 0..n {
+            if reg.mask[i] {
+                claimed[i] = true;
+            }
+        }
     }
 
-    // Step C：阴影画在最底层，其余按类渲染
-    items.sort_by_key(|&(kind, _, _, _)| kind);
-    for (kind, d, f, avg_a) in &items {
-        let op = (avg_a / 255.0).clamp(0.0, 1.0);
-        // 根据渐变类型选择渲染方式
-        let render_grad = |builder: &mut svg::SvgBuilder, d: &str, f: &gradient::Fit, op: f32| {
-            match f.grad_kind {
-                gradient::GradKind::Linear => builder.add_gradient_path(
-                    d, f.start_pt, f.end_pt, f.start_color, f.end_color, op,
-                ),
-                gradient::GradKind::Radial => builder.add_radial_gradient_path(
-                    d, f.center, f.radius, f.rad_center, f.rad_rim, op,
-                ),
-                gradient::GradKind::Mesh => {
-                    if let Some(ref mesh) = f.mesh {
-                        builder.add_mesh_path(d, mesh, op);
-                    } else {
-                        // 不应发生：mesh 系数缺失时回退为线性
-                        builder.add_gradient_path(
-                            d, f.start_pt, f.end_pt, f.start_color, f.end_color, op,
-                        );
-                    }
+    // Step B：纯色 —— 成熟的“黑白轮廓识别”。
+    // 把前景里未被渐变/阴影占用的像素，按颜色范围（color_tol）聚成若干调色板颜色；
+    // 每种颜色生成一张黑白掩码（该颜色=黑、其余=白），描出轮廓后填该色，
+    // 把所有颜色的结果叠加，即得到完整、干净的彩色轮廓。
+    let solid_buckets = quantize_solids(&raster, &fg, &claimed, opts.color_tol);
+    if std::env::var("PNG2SVG_DEBUG").is_ok() {
+        eprintln!(
+            "[dbg] solid buckets = {} （color_tol={}）",
+            solid_buckets.len(),
+            opts.color_tol
+        );
+        for (i, b) in solid_buckets.iter().enumerate() {
+            let mut minx = usize::MAX;
+            let mut miny = usize::MAX;
+            let mut maxx = 0usize;
+            let mut maxy = 0usize;
+            for (idx, &v) in b.mask.iter().enumerate() {
+                if v {
+                    let x = idx % (w as usize);
+                    let y = idx / (w as usize);
+                    if x < minx { minx = x; }
+                    if y < miny { miny = y; }
+                    if x > maxx { maxx = x; }
+                    if y > maxy { maxy = y; }
                 }
             }
-        };
-        match *kind {
-            KIND_SHADOW => {
-                if f.is_gradient {
-                    render_grad(&mut builder, d, f, op);
-                } else {
-                    builder.add_solid_path(d, f.mean, op);
-                }
-            }
-            KIND_GRADIENT => render_grad(&mut builder, d, f, 1.0),
-            _ => builder.add_solid_path(d, f.mean, 1.0),
+            eprintln!(
+                "[dbg]   bucket#{} color=rgb({},{},{}) pixels={} bbox=({},{}),({},{})",
+                i,
+                b.color.0,
+                b.color.1,
+                b.color.2,
+                b.mask.iter().filter(|&&v| v).count(),
+                minx,
+                miny,
+                maxx,
+                maxy
+            );
+        }
+    }
+
+    // Step C：按层级渲染：阴影（底层）→ 渐变 → 纯色（顶层）。
+    for (d, f, op) in &shadows {
+        if f.is_gradient {
+            render_gradient(&mut builder, d, f, *op);
+        } else {
+            builder.add_solid_path(d, f.mean, *op);
+        }
+    }
+    for (d, f) in &gradients {
+        render_gradient(&mut builder, d, f, 1.0);
+    }
+    for bucket in &solid_buckets {
+        let loops = contour::trace_with_holes(&bucket.mask, w, h);
+        let d = contour::loops_to_path(
+            &loops,
+            opts.simplify,
+            opts.circ_tol,
+            opts.ell_tol,
+            opts.smooth,
+        );
+        if !d.is_empty() {
+            builder.add_solid_path(&d, bucket.color, 1.0);
         }
     }
 
     let doc = builder.to_string();
     match &opts.output {
         Some(path) => match std::fs::write(path, &doc) {
-            Ok(_) => println!("已写出：{path}（{} 字节，{} 个区域）", doc.len(), items.len()),
+            Ok(_) => println!(
+                "已写出：{path}（{} 字节，{} 渐变 + {} 阴影 + {} 纯色）",
+                doc.len(),
+                gradients.len(),
+                shadows.len(),
+                solid_buckets.len()
+            ),
             Err(e) => {
                 eprintln!("写入失败：{e}");
                 exit(1);
@@ -242,6 +281,101 @@ fn build_foreground(raster: &Raster, alpha_thresh: f32, bg_thresh: f32, invert: 
     }
 }
 
+/// 按渐变类型把一条轮廓路径渲染成渐变填充（线性 / 径向 / 网格）。
+pub fn render_gradient(builder: &mut svg::SvgBuilder, d: &str, f: &gradient::Fit, op: f32) {
+    match f.grad_kind {
+        gradient::GradKind::Linear => {
+            builder.add_gradient_path(d, f.start_pt, f.end_pt, f.start_color, f.end_color, op)
+        }
+        gradient::GradKind::Radial => builder.add_radial_gradient_path(
+            d,
+            f.center,
+            f.radius,
+            f.rad_center,
+            f.rad_rim,
+            op,
+        ),
+        gradient::GradKind::Mesh => {
+            if let Some(ref mesh) = f.mesh {
+                builder.add_mesh_path(d, mesh, op);
+            } else {
+                // 不应发生：mesh 系数缺失时回退为线性
+                builder.add_gradient_path(d, f.start_pt, f.end_pt, f.start_color, f.end_color, op);
+            }
+        }
+    }
+}
+
+/// 一个纯色调色板桶：代表图像里“一种颜色范围”，以及它在整图中的黑白掩码。
+pub struct SolidBucket {
+    /// 桶的代表色（运行均值四舍五入）
+    pub color: (u8, u8, u8),
+    /// 该颜色像素的掩码（true = 属于此桶），即“该颜色=黑、其余=白”的黑白图。
+    pub mask: Vec<bool>,
+}
+
+/// 对前景中未被 claimed（即非渐变 / 非阴影）的像素，按颜色范围聚成若干调色板颜色。
+///
+/// 每种颜色对应一张黑白掩码（该颜色像素=黑、其余=白）；后续对每张掩码描轮廓、
+/// 填该色并叠加，即得到由各颜色轮廓叠加而成的完整彩色轮廓。相邻同色碎块会因
+/// 同属一个桶而自动合并成一个轮廓。
+fn quantize_solids(
+    raster: &Raster,
+    fg: &[bool],
+    claimed: &[bool],
+    tol: f32,
+) -> Vec<SolidBucket> {
+    let n = fg.len();
+    // 每个桶：运行均值（f64）+ 掩码 + 计数
+    let mut reps: Vec<(f64, f64, f64)> = Vec::new();
+    let mut masks: Vec<Vec<bool>> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+
+    for i in 0..n {
+        if !fg[i] || claimed[i] {
+            continue;
+        }
+        let (r, g, b, _) = raster.pixels[i];
+        // 找最近的已有桶（颜色距离 <= tol）
+        let mut best: Option<usize> = None;
+        let mut best_d = f32::MAX;
+        for (bi, rep) in reps.iter().enumerate() {
+            let d = raster::color_dist((r, g, b), (rep.0 as u8, rep.1 as u8, rep.2 as u8));
+            if d <= tol && d < best_d {
+                best_d = d;
+                best = Some(bi);
+            }
+        }
+        match best {
+            Some(bi) => {
+                let c = (counts[bi] + 1) as f64;
+                // 在线更新运行均值（作为后续像素的距离基准，也用于最终填色）
+                reps[bi].0 += (r as f64 - reps[bi].0) / c;
+                reps[bi].1 += (g as f64 - reps[bi].1) / c;
+                reps[bi].2 += (b as f64 - reps[bi].2) / c;
+                counts[bi] += 1;
+                masks[bi][i] = true;
+            }
+            None => {
+                let mut m = vec![false; n];
+                m[i] = true;
+                reps.push((r as f64, g as f64, b as f64));
+                masks.push(m);
+                counts.push(1);
+            }
+        }
+    }
+
+    reps
+        .into_iter()
+        .zip(masks)
+        .map(|(rep, mask)| SolidBucket {
+            color: (rep.0 as u8, rep.1 as u8, rep.2 as u8),
+            mask,
+        })
+        .collect()
+}
+
 fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut opts = Opts {
         input: String::new(),
@@ -257,6 +391,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         circ_tol: 0.025,
         ell_tol: 0.06,
         smooth: true,
+        color_tol: 32.0,
     };
     let mut i = 1;
     while i < args.len() {
@@ -310,6 +445,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 opts.smooth = false;
                 i += 1;
             }
+            "--color-tol" => {
+                opts.color_tol = next_f32(args, i)?;
+                i += 2;
+            }
             s if !s.starts_with('-') => {
                 if opts.input.is_empty() {
                     opts.input = s.to_string();
@@ -351,7 +490,8 @@ fn print_usage() {
   --simplify N       轮廓简化精度（默认 0.5，越小点越密）\n\
   --no-smooth        关闭曲线平滑，回退为纯多边形（配合小 --simplify 可得极密多边形）\n\
   --circ-tol N       圆拟合容许误差/半径（默认 0.06，越小越严格）\n\
-  --ell-tol N        椭圆拟合容许误差（默认 0.06，越小越严格）"
+  --ell-tol N        椭圆拟合容许误差（默认 0.06，越小越严格）\n\
+  --color-tol N      纯色按颜色范围聚类的容差（默认 32，越大合并越多颜色）"
     );
 }
 
