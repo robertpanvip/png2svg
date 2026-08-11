@@ -3,19 +3,15 @@ import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 plugins {
     id("java")
     id("org.jetbrains.kotlin.jvm") version "2.4.0"
-    id("org.jetbrains.intellij.platform") version "2.18.1"
+    // 版本由 settings.gradle.kts 的 org.jetbrains.intellij.platform.settings 统一托管
+    id("org.jetbrains.intellij.platform")
 }
 
 group = "com.pan"
 // 发布版本跟随 git tag（workflow 传 -PpluginVersion=1.2.3）；本地构建默认 SNAPSHOT
 version = providers.gradleProperty("pluginVersion").getOrElse("0.1.0-SNAPSHOT")
 
-repositories {
-    mavenCentral()
-    intellijPlatform {
-        defaultRepositories()
-    }
-}
+// 依赖仓库已在 settings.gradle.kts 的 dependencyResolutionManagement 中统一声明
 
 dependencies {
     intellijPlatform {

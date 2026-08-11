@@ -10,12 +10,7 @@ plugins {
 group = "com.pan"
 version = "0.1.0"
 
-repositories {
-    mavenCentral()
-    intellijPlatform {
-        defaultRepositories()
-    }
-}
+// 依赖仓库已在 settings.gradle.kts 的 dependencyResolutionManagement 中统一声明
 
 dependencies {
     // gradle.properties 关闭了默认 stdlib 注入，这里显式引入
