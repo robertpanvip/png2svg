@@ -85,11 +85,17 @@ pub fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
         loop {
             if i != ia && i != ib {
                 let d = point_line_dist(loop_[i], ca, cb);
-                if d > maxd { maxd = d; }
+                if d > maxd {
+                    maxd = d;
+                }
             }
-            if i == ib { break; }
+            if i == ib {
+                break;
+            }
             i = (i + 1) % loop_len;
-            if i == ia { break; }
+            if i == ia {
+                break;
+            }
         }
         maxd
     };
@@ -101,9 +107,13 @@ pub fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
         let mut i = ia;
         loop {
             run.push(loop_[i]);
-            if i == ib { break; }
+            if i == ib {
+                break;
+            }
             i = (i + 1) % loop_len;
-            if i == ia { break; }
+            if i == ia {
+                break;
+            }
         }
         run
     };
@@ -132,16 +142,31 @@ pub fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
     const T_HI: f64 = 1.25; // ~72° 尖角门限
     const T_TURN_STRAIGHT: f64 = 0.2; // ~11°
 
-    // 生成路径
-    let mut s = format!("M {} {}", pts[start_e].0, pts[start_e].1);
+    // ---------- Pass 1: 检测直线段 / 圆弧，收集为图元列表 ----------
+    // 先把整条轮廓切成「直线(L)」与「真圆弧(A)」交替的图元，延迟到 Pass 3 统一发射。
+    // 这样 Pass 2 才能两端同步校正弧端点而不破坏路径连通性。
+    #[derive(Clone, Copy)]
+    enum Item {
+        Line(usize),
+        Arc {
+            i: usize,
+            e_end: usize,
+            ccx: f64,
+            ccy: f64,
+            r: f64,
+            total: f64,
+        },
+    }
+    let mut items: Vec<Item> = Vec::new();
     let mut i = start_e;
-    let mut guard = 0;
+    let mut guard = 0usize;
     loop {
         guard += 1;
-        if guard > n + 2 { break; }
+        if guard > n + 2 {
+            break;
+        }
         // 1) 弧运行（弧优先）
         let nxt0 = (i + 1) % n;
-        let mut arc_emitted = false;
         if nxt0 != i && nxt0 != start_e {
             let arc_tol = arc_tol_abs as f64;
             let mut best_arc: Option<(f64, f64, f64, usize, f64, f32)> = None;
@@ -149,10 +174,16 @@ pub fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
             let mut safety = 0usize;
             loop {
                 let pnext = (e + 1) % n;
-                if pnext == i || pnext == start_e { break; }
-                if turn[pnext].abs() > T_HI { break; }
+                if pnext == i || pnext == start_e {
+                    break;
+                }
+                if turn[pnext].abs() > T_HI {
+                    break;
+                }
                 safety += 1;
-                if safety > 220 { break; }
+                if safety > 220 {
+                    break;
+                }
                 let prun = collect_run(i, pnext);
                 if let Some((ccx, ccy, rr, total, maxd)) =
                     fit_and_validate_arc(&prun, arc_tol, line_eps)
@@ -161,59 +192,193 @@ pub fn segment_primitives(loop_: &[(f32, f32)], eps: f32) -> String {
                     e = pnext;
                     continue;
                 }
-                if best_arc.is_some() { break; }
-                if safety >= 20 { break; }
+                if best_arc.is_some() {
+                    break;
+                }
+                if safety >= 20 {
+                    break;
+                }
                 e = pnext;
             }
             if let Some((ccx, ccy, r, e_end, total, maxd)) = best_arc {
                 let bow = chord_max_dev(i, e_end);
                 if bow > line_eps && maxd < bow * 0.7 && total.abs() > 0.6 {
-                    let end = pts[e_end];
-                    let large = if total.abs() > std::f64::consts::PI { 1 } else { 0 };
-                    let p0 = pts[i];
-                    let p1 = end;
-                    let mx = (p0.0 as f64 + p1.0 as f64) * 0.5;
-                    let my = (p0.1 as f64 + p1.1 as f64) * 0.5;
-                    let ddx = p1.0 as f64 - p0.0 as f64;
-                    let ddy = p1.1 as f64 - p0.1 as f64;
-                    let clen = (ddx * ddx + ddy * ddy).sqrt();
-                    let hh = (r * r - (clen * 0.5).powi(2)).max(0.0).sqrt();
-                    let nx = -ddy / clen;
-                    let ny = ddx / clen;
-                    let cp = (mx + hh * nx, my + hh * ny);
-                    let cm = (mx - hh * nx, my - hh * ny);
-                    let want_plus = (cp.0 - ccx).powi(2) + (cp.1 - ccy).powi(2)
-                        < (cm.0 - ccx).powi(2) + (cm.1 - ccy).powi(2);
-                    let sweep = if want_plus {
-                        if large == 1 { 0 } else { 1 }
-                    } else {
-                        if large == 1 { 1 } else { 0 }
-                    };
-                    s.push_str(&format!(
-                        " A {:.2} {:.2} 0 {} {} {:.2} {:.2}",
-                        r, r, large, sweep, end.0, end.1
-                    ));
+                    items.push(Item::Arc {
+                        i,
+                        e_end,
+                        ccx,
+                        ccy,
+                        r,
+                        total,
+                    });
                     i = e_end;
-                    if i == start_e { break; }
-                    arc_emitted = true;
+                    if i == start_e {
+                        break;
+                    }
+                    continue;
                 }
             }
         }
-        if arc_emitted { continue; }
         // 2) 直边运行
         let mut j = i;
         loop {
             let nxt = (j + 1) % n;
-            if nxt == i || nxt == start_e { break; }
+            if nxt == i || nxt == start_e {
+                break;
+            }
             if chord_max_dev(j, nxt) <= line_eps && turn[nxt].abs() < T_TURN_STRAIGHT {
                 j = nxt;
-            } else { break; }
+            } else {
+                break;
+            }
         }
-        if j == i { j = (i + 1) % n; }
-        let end = pts[j];
-        s.push_str(&format!(" L {} {}", end.0, end.1));
+        if j == i {
+            j = (i + 1) % n;
+        }
+        items.push(Item::Line(j));
         i = j;
-        if i == start_e { break; }
+        if i == start_e {
+            break;
+        }
+    }
+
+    // ---------- Pass 2: 弧端点切线校正（两端同步，保持路径连通） ----------
+    // 把每个圆弧的起/止顶点投影到拟合圆上：若相邻有足够长的直边，则取「该直边与圆相切」的
+    // 切点（圆弧与直边严格相切，且弦长<=直径，几何永有效）；否则退化为径向投影。
+    // 关键：相邻直线段与圆弧共享同一顶点索引，校正 cp[k] 同时服务于前一段的终点与后一段
+    // 的起点，因此整条路径天然连续，不会出现单端修正时的不对称/断裂。
+    let mut cp: Vec<(f64, f64)> = pts.iter().map(|&(x, y)| (x as f64, y as f64)).collect();
+    let project_to_circle = |p: (f64, f64), cx: f64, cy: f64, r: f64| -> (f64, f64) {
+        let dx = p.0 - cx;
+        let dy = p.1 - cy;
+        let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+        (cx + r * dx / d, cy + r * dy / d)
+    };
+    // 过点 p、方向 (dx,dy) 的直线与圆 (cx,cy,r) 的切点（取离 p 更近的那个候选）。
+    let tangent_point = |p: (f64, f64), dx: f64, dy: f64, cx: f64, cy: f64, r: f64| -> (f64, f64) {
+        let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+        let ux = dx / len;
+        let uy = dy / len;
+        let c1 = (cx + r * (-uy), cy + r * ux);
+        let c2 = (cx + r * uy, cy + r * (-ux));
+        let d1 = (c1.0 - p.0).powi(2) + (c1.1 - p.1).powi(2);
+        let d2 = (c2.0 - p.0).powi(2) + (c2.1 - p.1).powi(2);
+        if d1 < d2 {
+            c1
+        } else {
+            c2
+        }
+    };
+    for item in &items {
+        if let Item::Arc {
+            i,
+            e_end,
+            ccx,
+            ccy,
+            r,
+            ..
+        } = *item
+        {
+            // 入射方向：沿「简化顶点 i 之前的直边」向后走到尽头，取整段长边方向
+            // （单段相邻顶点可能极短，如起点附近的闭合段，会误判为径向投影）。
+            let mut a = i;
+            loop {
+                let prev = (a + n - 1) % n;
+                if prev == i {
+                    break;
+                }
+                if chord_max_dev(prev, a) <= line_eps && turn[prev].abs() < T_TURN_STRAIGHT {
+                    a = prev;
+                } else {
+                    break;
+                }
+            }
+            let cur = pts[i];
+            let din = (cur.0 as f64 - pts[a].0 as f64, cur.1 as f64 - pts[a].1 as f64);
+            if (din.0 * din.0 + din.1 * din.1).sqrt() > 3.0 {
+                cp[i] = tangent_point((cur.0 as f64, cur.1 as f64), din.0, din.1, ccx, ccy, r);
+            } else {
+                cp[i] = project_to_circle((cur.0 as f64, cur.1 as f64), ccx, ccy, r);
+            }
+            // 出射方向：沿「简化顶点 e_end 之后的直边」向前走到尽头。
+            let mut b = e_end;
+            loop {
+                let nxt = (b + 1) % n;
+                if nxt == e_end {
+                    break;
+                }
+                if chord_max_dev(b, nxt) <= line_eps && turn[nxt].abs() < T_TURN_STRAIGHT {
+                    b = nxt;
+                } else {
+                    break;
+                }
+            }
+            let cur2 = pts[e_end];
+            let dout = (pts[b].0 as f64 - cur2.0 as f64, pts[b].1 as f64 - cur2.1 as f64);
+            if (dout.0 * dout.0 + dout.1 * dout.1).sqrt() > 3.0 {
+                cp[e_end] =
+                    tangent_point((cur2.0 as f64, cur2.1 as f64), dout.0, dout.1, ccx, ccy, r);
+            } else {
+                cp[e_end] = project_to_circle((cur2.0 as f64, cur2.1 as f64), ccx, ccy, r);
+            }
+        }
+    }
+
+    // ---------- Pass 3: 发射（所有顶点用校正后的 cp） ----------
+    let mut s = format!("M {:.2} {:.2}", cp[start_e].0, cp[start_e].1);
+    for item in &items {
+        match *item {
+            Item::Line(j) => {
+                let p = cp[j];
+                s.push_str(&format!(" L {:.2} {:.2}", p.0, p.1));
+            }
+            Item::Arc {
+                i,
+                e_end,
+                ccx,
+                ccy,
+                r,
+                total,
+            } => {
+                let p0 = cp[i];
+                let p1 = cp[e_end];
+                // 由「拟合圆心」反推 (large, sweep)，确保 SVG 弧的圆心落在正确一侧：
+                // sub-180° 弧若仅按 total 符号取 sweep，圆心会错配到弦的另一侧 → 畸形；
+                // 半圆(h=0)时两侧重合，want_plus 取等→sweep=0，与旧版半圆行为一致。
+                let large = if total.abs() > std::f64::consts::PI {
+                    1
+                } else {
+                    0
+                };
+                let mx = (p0.0 + p1.0) * 0.5;
+                let my = (p0.1 + p1.1) * 0.5;
+                let ddx = p1.0 - p0.0;
+                let ddy = p1.1 - p0.1;
+                let clen = (ddx * ddx + ddy * ddy).sqrt();
+                let hh = (r * r - (clen * 0.5).powi(2)).max(0.0).sqrt();
+                let nx = -ddy / clen;
+                let ny = ddx / clen;
+                let cpc = (mx + hh * nx, my + hh * ny);
+                let cpm = (mx - hh * nx, my - hh * ny);
+                let want_plus = (cpc.0 - ccx).powi(2) + (cpc.1 - ccy).powi(2)
+                    < (cpm.0 - ccx).powi(2) + (cpm.1 - ccy).powi(2);
+                let sweep = if want_plus {
+                    if large == 1 {
+                        0
+                    } else {
+                        1
+                    }
+                } else if large == 1 {
+                    1
+                } else {
+                    0
+                };
+                s.push_str(&format!(
+                    " A {:.2} {:.2} 0 {} {} {:.2} {:.2}",
+                    r, r, large, sweep, p1.0, p1.1
+                ));
+            }
+        }
     }
     s.push_str(" Z");
     s

@@ -157,10 +157,6 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
     let mut sxy2 = 0.0; // Σ x' y'²
     let mut sx2y2 = 0.0; // Σ x'² y'²
 
-    // 径向所需
-    let mut sr = 0.0;
-    let mut sr2 = 0.0;
-
     // 每通道：平面 RHS / 总方差
     let mut srx = 0.0;
     let mut sry = 0.0;
@@ -181,13 +177,6 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
     let mut srx2y_b = 0.0;
     let mut sry2_b = 0.0;
     let mut srxy_b = 0.0;
-    // 每通道：径向 RHS（Σ dc, Σ r·dc）
-    let mut sr1_r = 0.0;
-    let mut srr_r = 0.0;
-    let mut sr1_g = 0.0;
-    let mut srr_g = 0.0;
-    let mut sr1_b = 0.0;
-    let mut srr_b = 0.0;
 
     // 包围盒（网格渲染用）+ 各通道颜色极值（方向无关的“整片颜色变化量”门限）
     let mut minx = f64::MAX;
@@ -207,15 +196,12 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         let dr = r as f64 - mr;
         let dg = g as f64 - mg;
         let db = b as f64 - mb;
-        let rp = (xp * xp + yp * yp).sqrt();
         sxx += xp * xp;
         syy += yp * yp;
         sxy += xp * yp;
         sx2y += xp * xp * yp;
         sxy2 += xp * yp * yp;
         sx2y2 += xp * xp * yp * yp;
-        sr += rp;
-        sr2 += rp * rp;
 
         srx += xp * dr;
         sry += yp * dr;
@@ -236,13 +222,6 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         srx2y_b += xp * xp * yp * db;
         sry2_b += xp * yp * yp * db;
         srxy_b += xp * yp * db;
-
-        sr1_r += dr;
-        srr_r += rp * dr;
-        sr1_g += dg;
-        srr_g += rp * dg;
-        sr1_b += db;
-        srr_b += rp * db;
 
         if (x as f64) < minx {
             minx = x as f64;
@@ -398,54 +377,120 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         });
     }
 
-    // ---------- 径向拟合（中心 = 质心） ----------
+    // 线性渐变主轴端点（供径向候选中心使用）
+    let start_pt = ((mx + ux * min_p) as f32, (my + uy * min_p) as f32);
+    let end_pt = ((mx + ux * max_p) as f32, (my + uy * max_p) as f32);
+
+    // ---------- 径向拟合（中心在多个候选点中择优） ----------
+    // 真实径向渐变的圆心不一定在质心（如 t_radial2 圆心在左上角 0.35,0.35）。若固定
+    // 中心=质心，径向 R² 远低于线性 → 误判为线性。改为在候选中心中挑选使径向 R² 最高者：
+    // 质心、包围盒中心、线性两端点、最亮/最暗像素（径向停止点常在极值色处）、包围盒 6×6 网格。
     let mut radial_r2 = 0.0;
     let mut rad_center = (mr as u8, mg as u8, mb as u8);
     let mut rad_rim = (mr as u8, mg as u8, mb as u8);
+    let mut rad_center_pt = (mx as f32, my as f32);
     let mut radius = 0.0f64;
-    if sr2 > 1e-9 {
-        // 设计矩阵 [1, r]，解 [a', k]：dc = a' + k·r
+
+    // 最亮 / 最暗像素位置
+    let mut best_lum = f64::MIN;
+    let mut worst_lum = f64::MAX;
+    let mut bright_pt = (mx, my);
+    let mut dark_pt = (mx, my);
+    for &(x, y, r, g, b, _a) in samples {
+        let lum = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+        if lum > best_lum {
+            best_lum = lum;
+            bright_pt = (x as f64, y as f64);
+        }
+        if lum < worst_lum {
+            worst_lum = lum;
+            dark_pt = (x as f64, y as f64);
+        }
+    }
+
+    let mut cand: Vec<(f64, f64)> = vec![
+        (mx, my),
+        ((minx + maxx) * 0.5, (miny + maxy) * 0.5),
+        (start_pt.0 as f64, start_pt.1 as f64),
+        (end_pt.0 as f64, end_pt.1 as f64),
+        bright_pt,
+        dark_pt,
+    ];
+    // 包围盒 6×6 网格
+    for gi in 0..6 {
+        for gj in 0..6 {
+            let cx = minx + (maxx - minx) * (gi as f64) / 5.0;
+            let cy = miny + (maxy - miny) * (gj as f64) / 5.0;
+            cand.push((cx, cy));
+        }
+    }
+    cand.sort_by(|a, b| {
+        (a.0, a.1)
+            .partial_cmp(&(b.0, b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cand.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
+
+    // 单中心径向拟合：color = a' + k·r（r = 到候选中心距离）
+    fn fit_radial_ch(
+        n: f64,
+        sr: f64,
+        sr2: f64,
+        det_r: f64,
+        r1: f64,
+        rr: f64,
+        total: f64,
+    ) -> (f64, f64, f64) {
+        let ap = (sr2 * r1 - sr * rr) / det_r;
+        let k = (n * rr - sr * r1) / det_r;
+        let ss_reg = ap * ap * n + 2.0 * ap * k * sr + k * k * sr2;
+        let ss_res = (total - ss_reg).max(0.0);
+        let r2 = if total <= 1e-12 {
+            1.0
+        } else {
+            (1.0 - ss_res / total).clamp(0.0, 1.0)
+        };
+        (ap, k, r2)
+    }
+
+    for (ccx, ccy) in cand {
+        let mut sr = 0.0f64;
+        let mut sr2 = 0.0f64;
+        let mut sr1_r = 0.0f64;
+        let mut srr_r = 0.0f64;
+        let mut sr1_g = 0.0f64;
+        let mut srr_g = 0.0f64;
+        let mut sr1_b = 0.0f64;
+        let mut srr_b = 0.0f64;
+        let mut rmax = 0.0f64;
+        for &(x, y, r, g, b, _a) in samples {
+            let rp = ((x as f64 - ccx).powi(2) + (y as f64 - ccy).powi(2)).sqrt();
+            sr += rp;
+            sr2 += rp * rp;
+            let dr = r as f64 - mr;
+            let dg = g as f64 - mg;
+            let db = b as f64 - mb;
+            sr1_r += dr;
+            srr_r += rp * dr;
+            sr1_g += dg;
+            srr_g += rp * dg;
+            sr1_b += db;
+            srr_b += rp * db;
+            if rp > rmax {
+                rmax = rp;
+            }
+        }
         let det_r = n * sr2 - sr * sr;
-        if det_r.abs() > 1e-9 {
-            // 逐通道
-            fn fit_radial(
-                n: f64,
-                sr: f64,
-                sr2: f64,
-                det_r: f64,
-                r1: f64,
-                rr: f64,
-                total: f64,
-            ) -> (f64, f64, f64) {
-                // a' = (Sr2·R1 - Sr·Rr)/det ; k = (n·Rr - Sr·R1)/det
-                let ap = (sr2 * r1 - sr * rr) / det_r;
-                let k = (n * rr - sr * r1) / det_r;
-                // R²
-                let mut ss_res = 0.0;
-                // 直接由公式：SS_res = total - (a'²·n + 2 a' k Sr + k² Sr2)
-                // 但更稳：SS_reg = ap²·n + 2 ap k Sr + k² Sr2
-                let ss_reg = ap * ap * n + 2.0 * ap * k * sr + k * k * sr2;
-                let ss_res = (total - ss_reg).max(0.0);
-                let r2 = if total <= 1e-12 {
-                    1.0
-                } else {
-                    (1.0 - ss_res / total).clamp(0.0, 1.0)
-                };
-                (ap, k, r2)
-            }
-            let (ar, kr, rr2rad) = fit_radial(n, sr, sr2, det_r, sr1_r, srr_r, tr);
-            let (ag, kg, rg2rad) = fit_radial(n, sr, sr2, det_r, sr1_g, srr_g, tg);
-            let (ab, kb, rb2rad) = fit_radial(n, sr, sr2, det_r, sr1_b, srr_b, tb);
-            radial_r2 = (rr2rad + rg2rad + rb2rad) / 3.0;
-            radius = (sr2 / n).sqrt().max((maxx - minx).max(maxy - miny) * 0.5);
-            // 实际最大半径（更贴合包围盒外缘）
-            let mut rmax = 0.0f64;
-            for &(x, y, _, _, _, _) in samples {
-                let rp = ((x as f64 - mx).powi(2) + (y as f64 - my).powi(2)).sqrt();
-                if rp > rmax {
-                    rmax = rp;
-                }
-            }
+        if det_r.abs() <= 1e-9 {
+            continue;
+        }
+        let (ar, kr, rr2rad) = fit_radial_ch(n, sr, sr2, det_r, sr1_r, srr_r, tr);
+        let (ag, kg, rg2rad) = fit_radial_ch(n, sr, sr2, det_r, sr1_g, srr_g, tg);
+        let (ab, kb, rb2rad) = fit_radial_ch(n, sr, sr2, det_r, sr1_b, srr_b, tb);
+        let cand_r2 = (rr2rad + rg2rad + rb2rad) / 3.0;
+        if cand_r2 > radial_r2 {
+            radial_r2 = cand_r2;
+            rad_center_pt = (ccx as f32, ccy as f32);
             radius = rmax;
             let cc = (
                 (mr + ar).clamp(0.0, 255.0),
@@ -453,9 +498,9 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
                 (mb + ab).clamp(0.0, 255.0),
             );
             let rc = (
-                (mr + ar + kr * radius).clamp(0.0, 255.0),
-                (mg + ag + kg * radius).clamp(0.0, 255.0),
-                (mb + ab + kb * radius).clamp(0.0, 255.0),
+                (mr + ar + kr * rmax).clamp(0.0, 255.0),
+                (mg + ag + kg * rmax).clamp(0.0, 255.0),
+                (mb + ab + kb * rmax).clamp(0.0, 255.0),
             );
             rad_center = (cc.0 as u8, cc.1 as u8, cc.2 as u8);
             rad_rim = (rc.0 as u8, rc.1 as u8, rc.2 as u8);
@@ -478,9 +523,6 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         GradKind::Linear
     };
 
-    let start_pt = ((mx + ux * min_p) as f32, (my + uy * min_p) as f32);
-    let end_pt = ((mx + ux * max_p) as f32, (my + uy * max_p) as f32);
-
     Fit {
         is_gradient,
         grad_kind,
@@ -489,7 +531,7 @@ pub fn fit(samples: &[(f32, f32, u8, u8, u8, u8)], p: &FitParams) -> Fit {
         end_pt,
         start_color,
         end_color,
-        center: (mx as f32, my as f32),
+        center: rad_center_pt,
         radius: radius as f32,
         rad_center,
         rad_rim,
