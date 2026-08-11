@@ -67,12 +67,19 @@ jobs:
         continue-on-error: true
 
 
-      # 发布到 JetBrains 插件市场（仅当仓库配置了 JETBRAINS_MARKETPLACE_TOKEN 时）
+      # 发布到 JetBrains 插件市场
+      # 说明：secrets 上下文不能出现在 if: 条件里，因此改为“始终运行 + 用 env 映射 secret +
+      # shell 判空跳过”。未配置 JETBRAINS_MARKETPLACE_TOKEN 时步骤会优雅跳过，不影响 Release 构建。
       - name: Publish to JetBrains Marketplace
-        if: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN != '' }}
-        run: ./gradlew :plugin:publishPlugin -PpluginVersion=${{ steps.tag.outputs.plugin_version }} --no-configuration-cache
         env:
           JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+          PLUGIN_VERSION: ${{ steps.tag.outputs.plugin_version }}
+        run: |
+          if [ -z "$JETBRAINS_MARKETPLACE_TOKEN" ]; then
+            echo "JETBRAINS_MARKETPLACE_TOKEN is not set; skipping Marketplace publish."
+            exit 0
+          fi
+          ./gradlew :plugin:publishPlugin -PpluginVersion="$PLUGIN_VERSION" --no-configuration-cache
 
 
       # 创建 GitHub Release 并上传插件 zip
