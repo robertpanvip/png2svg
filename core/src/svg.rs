@@ -46,6 +46,23 @@ impl SvgBuilder {
         ));
     }
 
+    /// 添加一个纯色「描边」路径（fill=none，stroke=color，stroke-width=W）。
+    /// 用于把图像的线稿 / 描边渲染成真正的 SVG 描边——内部保持透明，
+    /// 适合图标线稿（描边轮廓而非填充色块）。圆角端点/连接规避尖角毛刺。
+    pub fn add_stroke_path(&mut self, d: &str, color: (u8, u8, u8), width: f32) {
+        if d.is_empty() {
+            return;
+        }
+        let w = width.max(0.1);
+        self.bodies.push(format!(
+            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.3}\" \
+stroke-linecap=\"round\" stroke-linejoin=\"round\"/>",
+            d,
+            Self::rgb(color),
+            w
+        ));
+    }
+
     /// 添加一个线性渐变填充路径，返回渐变是否被创建。
     /// opacity < 1.0 时输出 fill-opacity（用于半透明渐变阴影）。
     pub fn add_gradient_path(

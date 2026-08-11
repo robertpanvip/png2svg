@@ -50,6 +50,8 @@ struct Opts {
     smooth: bool,
     /// 纯色按颜色范围聚类的容差（即“颜色范围”的粗细）
     color_tol: f32,
+    /// 判为描边（stroke）的最大平均半宽：细长区域平均宽度 <= 此值才识别为描边
+    stroke_max: f32,
 }
 
 fn main() {
@@ -62,6 +64,16 @@ fn main() {
     if args[1] == "gen-test" {
         let out = args.get(2).cloned().unwrap_or_else(|| "test_icon.png".into());
         gen_test(&out);
+        return;
+    }
+    if args[1] == "gen-stroke" {
+        let out = args.get(2).cloned().unwrap_or_else(|| "stroke_icon.png".into());
+        gen_stroke(&out);
+        return;
+    }
+    if args[1] == "gen-mixed" {
+        let out = args.get(2).cloned().unwrap_or_else(|| "mixed_icon.png".into());
+        gen_mixed(&out);
         return;
     }
 
@@ -210,7 +222,7 @@ fn main() {
         }
     }
 
-    // Step C：按层级渲染：阴影（底层）→ 渐变 → 纯色（顶层）。
+    // Step C：按层级渲染：阴影（底层）→ 渐变 → 纯色/描边（顶层）。
     for (d, f, op) in &shadows {
         if f.is_gradient {
             render_gradient(&mut builder, d, f, *op);
@@ -221,17 +233,76 @@ fn main() {
     for (d, f) in &gradients {
         render_gradient(&mut builder, d, f, 1.0);
     }
+    // 纯色：每个桶拆成连通分量，逐分量判定是「填充色块」还是「描边（线稿）」。
+    // 判定规则（比单纯看宽度更鲁棒）：
+    //   - 有孔洞（trace 出内孔）→ 空心轮廓（圆环 / 星框 / 任意环形）→ 描边；
+    //   - 无孔洞但足够细长（平均宽度 <= stroke_max 且长宽比 >= 2.5）→ 线条 → 描边；
+    //   - 其余 → 填充色块。
+    // 渲染：
+    //   - 空心轮廓用「填色带 + evenodd 真洞」精确还原（无偏移）；
+    //   - 细线条向内腐蚀约半宽后描真实 SVG 描边（fill=none），内部保持透明且可缩放；
+    //   - 填充色块直接填色。
+    let mut n_strokes = 0usize;
     for bucket in &solid_buckets {
-        let loops = contour::trace_with_holes(&bucket.mask, w, h);
-        let d = contour::loops_to_path(
-            &loops,
-            opts.simplify,
-            opts.circ_tol,
-            opts.ell_tol,
-            opts.smooth,
-        );
-        if !d.is_empty() {
-            builder.add_solid_path(&d, bucket.color, 1.0);
+        for comp in components(&bucket.mask, w as usize, h as usize) {
+            let loops = contour::trace_with_holes(&comp, w, h);
+            let has_hole = loops.len() > 1;
+            let (is_thin, width) = classify_stroke(&comp, w as usize, h as usize, opts.stroke_max);
+            let is_stroke = has_hole || is_thin;
+
+            if std::env::var("PNG2SVG_DEBUG").is_ok() {
+                eprintln!(
+                    "[dbg] comp color=({}) stroke={} has_hole={} width={:.2}",
+                    {
+                        let c = bucket.color;
+                        format!("{},{},{}", c.0, c.1, c.2)
+                    },
+                    is_stroke,
+                    has_hole,
+                    width
+                );
+            }
+
+            if is_stroke && !has_hole {
+                // 细线条：腐蚀约半宽使轮廓落在带中心线上，再以 width 描边（限制腐蚀量，
+                // 避免极细环被蚀断；腐蚀后若变空则回退到原始掩码）。
+                let k = (((width / 2.0 - 1.0).max(0.0)).round() as i32).min(2);
+                let eroded = if k > 0 {
+                    Some(erode(&comp, w as usize, h as usize, k as usize))
+                } else {
+                    None
+                };
+                let mask_used: &[bool] = match &eroded {
+                    Some(e) if e.iter().any(|&v| v) => e,
+                    _ => &comp,
+                };
+                let d = contour::loops_to_path(
+                    &contour::trace_with_holes(mask_used, w, h),
+                    opts.simplify,
+                    opts.circ_tol,
+                    opts.ell_tol,
+                    opts.smooth,
+                );
+                if !d.is_empty() {
+                    builder.add_stroke_path(&d, bucket.color, width);
+                    n_strokes += 1;
+                }
+            } else {
+                // 空心轮廓（精确带洞填充）或普通填充色块：都走填色。
+                let d = contour::loops_to_path(
+                    &loops,
+                    opts.simplify,
+                    opts.circ_tol,
+                    opts.ell_tol,
+                    opts.smooth,
+                );
+                if !d.is_empty() {
+                    if is_stroke {
+                        n_strokes += 1;
+                    }
+                    builder.add_solid_path(&d, bucket.color, 1.0);
+                }
+            }
         }
     }
 
@@ -239,11 +310,12 @@ fn main() {
     match &opts.output {
         Some(path) => match std::fs::write(path, &doc) {
             Ok(_) => println!(
-                "已写出：{path}（{} 字节，{} 渐变 + {} 阴影 + {} 纯色）",
+                "已写出：{path}（{} 字节，{} 渐变 + {} 阴影 + {} 填充 + {} 描边）",
                 doc.len(),
                 gradients.len(),
                 shadows.len(),
-                solid_buckets.len()
+                solid_buckets.len().saturating_sub(n_strokes),
+                n_strokes
             ),
             Err(e) => {
                 eprintln!("写入失败：{e}");
@@ -376,6 +448,147 @@ fn quantize_solids(
         .collect()
 }
 
+/// 把一个掩码拆成 8-连通分量（线稿的对角连接也视为同一笔）。
+/// 返回每个分量各自的掩码（与输入同尺寸，便于直接描轮廓）。
+fn components(mask: &[bool], w: usize, h: usize) -> Vec<Vec<bool>> {
+    let n = mask.len();
+    let mut label = vec![usize::MAX; n];
+    let mut comps: Vec<Vec<bool>> = Vec::new();
+    let neigh: [(i32, i32); 8] = [
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (1, -1),
+        (-1, 1),
+        (-1, -1),
+    ];
+    for start in 0..n {
+        if !mask[start] || label[start] != usize::MAX {
+            continue;
+        }
+        let idx = comps.len();
+        let mut comp = vec![false; n];
+        let mut stack = vec![start];
+        label[start] = idx;
+        while let Some(p) = stack.pop() {
+            comp[p] = true;
+            let x = (p % w) as i32;
+            let y = (p / w) as i32;
+            for &(dx, dy) in &neigh {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let q = ny as usize * w + nx as usize;
+                if mask[q] && label[q] == usize::MAX {
+                    label[q] = idx;
+                    stack.push(q);
+                }
+            }
+        }
+        comps.push(comp);
+    }
+    comps
+}
+
+/// 4-邻域腐蚀 k 次：把掩码向内收缩，用于把描边带收缩到中心线附近。
+fn erode(mask: &[bool], w: usize, h: usize, k: usize) -> Vec<bool> {
+    let mut cur = mask.to_vec();
+    let neigh: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    for _ in 0..k {
+        let mut next = vec![false; cur.len()];
+        for i in 0..cur.len() {
+            if !cur[i] {
+                continue;
+            }
+            let x = (i % w) as i32;
+            let y = (i / w) as i32;
+            let mut alive = true;
+            for &(dx, dy) in &neigh {
+                let nx = x + dx;
+                let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    alive = false;
+                    break;
+                }
+                if !cur[ny as usize * w + nx as usize] {
+                    alive = false;
+                    break;
+                }
+            }
+            if alive {
+                next[i] = true;
+            }
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// 判定一个连通分量应该是「描边」还是「填充」：
+/// - 平均宽度 thickness = 2·面积 / 周长（面积≈像素数，周长≈外边界像素数）；
+/// - 越细长（长轴 / thickness 越大）越像一笔线稿。
+/// 同时满足 thickness <= stroke_max 且 长宽比 >= 2.5 才判为描边。
+fn classify_stroke(mask: &[bool], w: usize, h: usize, stroke_max: f32) -> (bool, f32) {
+    let n = mask.len();
+    let mut area = 0usize;
+    let mut boundary = 0usize;
+    let mut minx = i32::MAX;
+    let mut miny = i32::MAX;
+    let mut maxx = i32::MIN;
+    let mut maxy = i32::MIN;
+    let neigh: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    for i in 0..n {
+        if !mask[i] {
+            continue;
+        }
+        area += 1;
+        let x = (i % w) as i32;
+        let y = (i / w) as i32;
+        if x < minx {
+            minx = x;
+        }
+        if y < miny {
+            miny = y;
+        }
+        if x > maxx {
+            maxx = x;
+        }
+        if y > maxy {
+            maxy = y;
+        }
+        let mut edge = false;
+        for &(dx, dy) in &neigh {
+            let nx = x + dx;
+            let ny = y + dy;
+            if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                edge = true;
+                break;
+            }
+            if !mask[ny as usize * w + nx as usize] {
+                edge = true;
+                break;
+            }
+        }
+        if edge {
+            boundary += 1;
+        }
+    }
+    if area == 0 {
+        return (false, 0.0);
+    }
+    let thickness = 2.0 * area as f32 / (boundary as f32).max(1.0);
+    let bw = (maxx - minx + 1) as f32;
+    let bh = (maxy - miny + 1) as f32;
+    let major = bw.max(bh);
+    let elong = if thickness > 0.0 { major / thickness } else { f32::MAX };
+    let is_stroke = thickness <= stroke_max && elong >= 2.5;
+    (is_stroke, thickness)
+}
+
 fn parse_args(args: &[String]) -> Result<Opts, String> {
     let mut opts = Opts {
         input: String::new(),
@@ -392,6 +605,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         ell_tol: 0.06,
         smooth: true,
         color_tol: 32.0,
+        stroke_max: 10.0,
     };
     let mut i = 1;
     while i < args.len() {
@@ -449,6 +663,10 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 opts.color_tol = next_f32(args, i)?;
                 i += 2;
             }
+            "--stroke-max" => {
+                opts.stroke_max = next_f32(args, i)?;
+                i += 2;
+            }
             s if !s.starts_with('-') => {
                 if opts.input.is_empty() {
                     opts.input = s.to_string();
@@ -478,7 +696,9 @@ fn print_usage() {
         "png2svg —— 面向 icon 的 PNG→SVG 工具（按颜色/alpha 区分轮廓，识别纯色/渐变/阴影）\n\
 用法：\n\
   png2svg <input.png> [-o out.svg] [选项]\n\
-  png2svg gen-test [out.png]           生成测试图标\n\
+  png2svg gen-test [out.png]           生成测试图标（渐变+纯色+阴影）\n\
+  png2svg gen-stroke [out.png]         生成纯线稿测试图标（描边）\n\
+  png2svg gen-mixed [out.png]          生成综合测试图标（描边+填充+渐变+阴影）\n\
 选项：\n\
   --tolerance N      颜色+alpha 分割容差（默认 28）\n\
   --alpha N          前景 alpha 阈值 0-255（默认 8，调低可纳入更淡的阴影）\n\
@@ -491,7 +711,8 @@ fn print_usage() {
   --no-smooth        关闭曲线平滑，回退为纯多边形（配合小 --simplify 可得极密多边形）\n\
   --circ-tol N       圆拟合容许误差/半径（默认 0.06，越小越严格）\n\
   --ell-tol N        椭圆拟合容许误差（默认 0.06，越小越严格）\n\
-  --color-tol N      纯色按颜色范围聚类的容差（默认 32，越大合并越多颜色）"
+  --color-tol N      纯色按颜色范围聚类的容差（默认 32，越大合并越多颜色）\n\
+  --stroke-max N     平均宽度 <= 此值的细长区域识别为描边而非填充（默认 10）"
     );
 }
 
@@ -533,4 +754,152 @@ fn gen_test(path: &str) {
         exit(1);
     }
     println!("已生成测试图标：{path}");
+}
+
+/// 点到线段 (a,b) 的最短距离，用于绘制线稿（描边）。
+fn dist_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let vx = bx - ax;
+    let vy = by - ay;
+    let wx = px - ax;
+    let wy = py - ay;
+    let c1 = vx * wx + vy * wy;
+    if c1 <= 0.0 {
+        return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+    }
+    let c2 = vx * vx + vy * vy;
+    if c2 <= c1 {
+        return ((px - bx).powi(2) + (py - by).powi(2)).sqrt();
+    }
+    let t = c1 / c2;
+    let projx = ax + t * vx;
+    let projy = ay + t * vy;
+    ((px - projx).powi(2) + (py - projy).powi(2)).sqrt()
+}
+
+/// 生成纯线稿测试图标：圆环 + 五角星轮廓 + 加号 + 箭头，全部同一深色描边，
+/// 用于验证 stroke 描边识别（内部应为透明而非实心）。
+fn gen_stroke(path: &str) {
+    use image::{Rgba, RgbaImage};
+    let size = 256u32;
+    let mut img = RgbaImage::new(size, size);
+    let col = (50u8, 55, 70);
+
+    // 各形状分置四角，彼此留足间距（>=20px），避免连通合并。
+    // 圆环（左上）：中心 (64,64)，半径 44，半宽 4 → 带宽 8
+    let ring_c = (64.0, 64.0);
+    let ring_r = 44.0;
+    let ring_hw = 4.0;
+    // 五角星轮廓（右上）：中心 (192,64)，外径 40 / 内径 18，半宽 4
+    let star_c = (192.0, 64.0);
+    let outer = 40.0;
+    let inner = 18.0;
+    let star_hw = 4.0;
+    let mut verts: Vec<(f32, f32)> = Vec::new();
+    for k in 0..10 {
+        let ang = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+        let rr = if k % 2 == 0 { outer } else { inner };
+        verts.push((star_c.0 + rr * ang.cos(), star_c.1 + rr * ang.sin()));
+    }
+    // 加号（左下）：中心 (64,192)，两臂半宽 4，长 34
+    let plus_c = (64.0, 192.0);
+    let bar_hw = 4.0;
+    let bar_len = 34.0;
+    // 箭头（右下）：水平主干 (150,192)->(218,192)，半宽 4，箭头尖在 (218,192)
+    let arrow_hw = 4.0;
+
+    for y in 0..size {
+        for x in 0..size {
+            let mut on = false;
+            // 圆环
+            let dx = x as f32 - ring_c.0;
+            let dy = y as f32 - ring_c.1;
+            if ((dx * dx + dy * dy).sqrt() - ring_r).abs() <= ring_hw {
+                on = true;
+            }
+            // 五角星轮廓：到任一条边距离 <= 半宽
+            if !on {
+                for e in 0..10 {
+                    let a = verts[e];
+                    let b = verts[(e + 1) % 10];
+                    if dist_seg(x as f32, y as f32, a.0, a.1, b.0, b.1) <= star_hw {
+                        on = true;
+                        break;
+                    }
+                }
+            }
+            // 加号
+            if !on {
+                let dx = x as f32 - plus_c.0;
+                let dy = y as f32 - plus_c.1;
+                if dx.abs() <= bar_hw && dy.abs() <= bar_len {
+                    on = true;
+                }
+                if dy.abs() <= bar_hw && dx.abs() <= bar_len {
+                    on = true;
+                }
+            }
+            // 箭头（主干 + 箭头尖）
+            if !on {
+                if dist_seg(x as f32, y as f32, 150.0, 192.0, 218.0, 192.0) <= arrow_hw {
+                    on = true;
+                }
+                if dist_seg(x as f32, y as f32, 218.0, 192.0, 196.0, 178.0) <= arrow_hw {
+                    on = true;
+                }
+                if dist_seg(x as f32, y as f32, 218.0, 192.0, 196.0, 206.0) <= arrow_hw {
+                    on = true;
+                }
+            }
+            if on {
+                img.put_pixel(x, y, Rgba([col.0, col.1, col.2, 255]));
+            } else {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            }
+        }
+    }
+    if let Err(e) = img.save(path) {
+        eprintln!("保存测试图失败：{e}");
+        exit(1);
+    }
+    println!("已生成线稿测试图标：{path}");
+}
+
+/// 生成综合测试图标：填充圆（实心）+ 描边圆环（线稿）+ 渐变条 + 半透明阴影。
+/// 用于一次性验证 填充 / 描边 / 渐变 / 阴影 四类识别是否都正确。
+fn gen_mixed(path: &str) {
+    use image::{Rgba, RgbaImage};
+    let size = 256u32;
+    let mut img = RgbaImage::new(size, size);
+    let cx = 128.0;
+    let cy = 128.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let r = (dx * dx + dy * dy).sqrt();
+            let (pr, pg, pb, pa) = if ((x as f32 - 158.0).powi(2)) / (60.0_f32.powi(2))
+                + ((y as f32 - 158.0).powi(2)) / (22.0_f32.powi(2))
+                <= 1.0
+            {
+                (20, 20, 30, 70) // 半透明阴影（椭圆投影，落在右下）
+            } else if r <= 50.0 {
+                (40, 120, 220, 255) // 实心蓝圆（填充）
+            } else if (r - 92.0).abs() <= 5.0 {
+                (240, 150, 40, 255) // 橙色圆环（描边，带宽 10）
+            } else if x >= 24 && x <= 232 && y >= 198 && y <= 226 {
+                // 渐变条：颜色随 x 线性变化
+                let rr = (x as f32 * 0.9).clamp(0.0, 255.0) as u8;
+                let bb = ((256.0 - x as f32) * 0.9).clamp(0.0, 255.0) as u8;
+                (rr, 90, bb, 255)
+            } else {
+                (0, 0, 0, 0)
+            };
+            img.put_pixel(x, y, Rgba([pr, pg, pb, pa]));
+        }
+    }
+    if let Err(e) = img.save(path) {
+        eprintln!("保存测试图失败：{e}");
+        exit(1);
+    }
+    println!("已生成综合测试图标：{path}");
 }
