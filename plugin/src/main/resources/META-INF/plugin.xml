@@ -1,0 +1,28 @@
+<idea-plugin>
+    <id>com.pan.png2svg</id>
+    <name>png2svg</name>
+    <vendor email="dev@example.com" url="https://github.com/robertpanvip/png2svg">pan</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <description><![CDATA[
+        <p>将 PNG 图标一键转换为矢量 SVG。</p>
+        <ul>
+            <li>基于 Rust 写成的 <code>png2svg</code> 内核（core 模块），按颜色/alpha 区分轮廓，
+                自动识别纯色 / 渐变 / 阴影区域。</li>
+            <li>在 Project View 或编辑器标签页中右键 PNG 文件，选择
+                <b>Convert to SVG</b> 即可在同目录生成同名 .svg 并自动打开。</li>
+        </ul>
+    ]]></description>
+
+    <actions>
+        <action
+                id="com.pan.png2svg.idea.ConvertToSvgAction"
+                class="com.pan.png2svg.idea.ConvertToSvgAction"
+                text="Convert to SVG"
+                description="使用 png2svg 将选中的 PNG 转换为矢量 SVG">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorTabPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
