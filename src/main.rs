@@ -115,6 +115,52 @@ fn main() {
         } else {
             KIND_SOLID
         };
+
+        // 区域包围盒（诊断 + 细长效验）
+        let (mut bx0, mut by0, mut bx1, mut by1) =
+            (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for &(x, y, _, _, _, _) in &reg.samples {
+            if x < bx0 {
+                bx0 = x;
+            }
+            if y < by0 {
+                by0 = y;
+            }
+            if x > bx1 {
+                bx1 = x;
+            }
+            if y > by1 {
+                by1 = y;
+            }
+        }
+        let bw = (bx1 - bx0).max(0.0);
+        let bh = (by1 - by0).max(0.0);
+        let aspect = if bw.min(bh) > 0.0 {
+            bw.max(bh) / bw.min(bh)
+        } else {
+            f32::MAX
+        };
+        if std::env::var("PNG2SVG_DEBUG").is_ok() {
+            eprintln!(
+                "[dbg] n={} avg_a={:.1} kind={} bbox=({:.1},{:.1})-({:.1},{:.1}) aspect={:.1}",
+                reg.samples.len(),
+                avg_a,
+                kind,
+                bx0,
+                by0,
+                bx1,
+                by1,
+                aspect
+            );
+        }
+
+        // 细长条（近直线边缘的抗锯齿像素）会被洪泛分割出来、误判为阴影，
+        // 因近直线段圆拟合半径被放大成巨大圆，渲染出淡大圆光晕。这类像素本就是
+        // 相邻实色形状的边界，直接丢弃（不渲染），既消除光晕也不损失形状信息。
+        if kind == KIND_SHADOW && aspect > 5.0 {
+            continue;
+        }
+
         items.push((kind, d, f, avg_a));
     }
 
