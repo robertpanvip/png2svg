@@ -7,7 +7,8 @@ plugins {
 }
 
 group = "com.pan"
-version = "0.1.0"
+// 发布版本跟随 git tag（workflow 传 -PpluginVersion=1.2.3）；本地构建默认 SNAPSHOT
+version = providers.gradleProperty("pluginVersion").getOrElse("0.1.0-SNAPSHOT")
 
 repositories {
     mavenCentral()
@@ -43,6 +44,12 @@ intellijPlatform {
         changeNotes = """
             0.1.0 初始版本：右键 PNG 文件一键转换为 SVG（由 Rust core 实现）
         """.trimIndent()
+    }
+
+    // 发布到 JetBrains 插件市场（release 工作流设置 JETBRAINS_MARKETPLACE_TOKEN 后生效）
+    publishPlugin {
+        token.set(providers.environmentVariable("JETBRAINS_MARKETPLACE_TOKEN").orElse(""))
+        channels.set(listOf(providers.gradleProperty("pluginChannel").getOrElse("default")))
     }
 }
 

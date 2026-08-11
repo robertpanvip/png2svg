@@ -1,0 +1,87 @@
+name: Release Plugin
+
+# 触发：推送 v* 标签，或手动指定 tag 触发
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+
+      # 安装 JDK（与 plugin/core 的 Java 21 toolchain 一致）
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+
+      # 使用项目自带的 Gradle 9.4.1 wrapper
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+
+      # 解析发布标签：pluginVersion 去掉前缀 v（v1.2.3 -> 1.2.3）
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.tag }}"
+          else
+            RAW="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$RAW" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=${RAW#v}" >> "$GITHUB_OUTPUT"
+
+
+      # 构建插件 zip（:plugin 模块；core 的 jar 会被打进依赖）
+      - name: Build plugin
+        run: ./gradlew :plugin:buildPlugin -PpluginVersion=${{ steps.tag.outputs.plugin_version }} --no-configuration-cache
+
+
+      # 插件校验（IDEA 兼容性检查，失败时不影响发布）
+      - name: Verify plugin
+        run: ./gradlew :plugin:verifyPlugin -PpluginVersion=${{ steps.tag.outputs.plugin_version }} --no-configuration-cache
+        continue-on-error: true
+
+
+      # 发布到 JetBrains 插件市场（仅当仓库配置了 JETBRAINS_MARKETPLACE_TOKEN 时）
+      - name: Publish to JetBrains Marketplace
+        if: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN != '' }}
+        run: ./gradlew :plugin:publishPlugin -PpluginVersion=${{ steps.tag.outputs.plugin_version }} --no-configuration-cache
+        env:
+          JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+
+
+      # 创建 GitHub Release 并上传插件 zip
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: |
+            plugin/build/distributions/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
