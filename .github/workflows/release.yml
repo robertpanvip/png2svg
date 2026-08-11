@@ -42,6 +42,11 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
 
 
+      # 确保 gradlew 有可执行权限（Windows 提交会丢失 +x 位，导致 Linux runner 报 Permission denied）
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+
       # 解析发布标签：pluginVersion 去掉前缀 v（v1.2.3 -> 1.2.3）
       - name: Resolve release tag
         id: tag

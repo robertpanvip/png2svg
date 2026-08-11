@@ -30,6 +30,10 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
+      # 确保 gradlew 有可执行权限（Windows 提交会丢失 +x 位，导致 Linux runner 报 Permission denied）
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
       - name: Run tests
         run: ./gradlew test --no-daemon --no-configuration-cache
         continue-on-error: true
