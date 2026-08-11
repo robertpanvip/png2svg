@@ -28,10 +28,12 @@ dependencies {
 
         // 单元测试用平台测试框架
         testFramework(TestFrameworkType.Platform)
-    }
 
-    // 复用 core 的 Kotlin 包装层与原生二进制
-    implementation(project(":core"))
+        // 关键：用 pluginModule(...) 把 core 作为“插件内容模块”打包进 lib/modules/。
+        // 仅写 implementation(project(":core")) 时，IJ 平台插件不会把 core.jar 打进插件包，
+        // 运行时插件类加载器找不到 Png2SvgConverter → NoClassDefFoundError。
+        pluginModule(implementation(project(":core")))
+    }
 
     testImplementation("junit:junit:4.13.2")
 }
