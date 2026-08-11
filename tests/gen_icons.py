@@ -214,6 +214,56 @@ def _rings(d, cx, cy, rs):
         d.ellipse([q(cx - r + 10), q(cy - r + 10), q(cx + r - 10), q(cy + r - 10)], fill=0)
 
 
+def _moon(d, cx, cy, r, ox, oy):
+    # 月牙：大圆盘 - 偏移小圆盘（布尔差，应识别为两段弧在 2 个交点 cusp）。
+    d.ellipse([q(cx - r), q(cy - r), q(cx + r), q(cy + r)], fill=255)
+    d.ellipse([q(cx - r + ox), q(cy - r + oy), q(cx + r + ox), q(cy + r + oy)], fill=0)
+
+
+def _bolt(d, cx, cy, s):
+    # 闪电：尖锐锯齿多边形（应保持折线锐利，不被圆化）。
+    pts = [(cx + 0.05 * s, cy - 0.95 * s), (cx - 0.45 * s, cy + 0.10 * s),
+           (cx - 0.10 * s, cy + 0.10 * s), (cx - 0.20 * s, cy + 0.95 * s),
+           (cx + 0.50 * s, cy - 0.05 * s), (cx + 0.15 * s, cy - 0.05 * s)]
+    d.polygon([(q(x), q(y)) for (x, y) in pts], fill=255)
+
+
+def _arrow(d, cx, cy, w, h):
+    # 右箭头：矩形杆 + 三角头（多边形 + 直线，测多边形分支）。
+    d.rectangle([q(cx - w / 2), q(cy - h / 4), q(cx + w / 6), q(cy + h / 4)], fill=255)
+    d.polygon([(q(cx + w / 6), q(cy - h / 2)), (q(cx + w / 6), q(cy + h / 2)),
+               (q(cx + w / 2), q(cy))], fill=255)
+
+
+def _plus(d, cx, cy, w, t):
+    # 加号/十字：两矩形并集（凹多边形，应保持直角）。
+    d.rectangle([q(cx - t / 2), q(cy - w / 2), q(cx + t / 2), q(cy + w / 2)], fill=255)
+    d.rectangle([q(cx - w / 2), q(cy - t / 2), q(cx + w / 2), q(cy + t / 2)], fill=255)
+
+
+def _shield(d, cx, cy, r):
+    # 盾牌：平顶 + 直边收至尖端（平滑-尖点混合，测尖角保留）。
+    pts = [(cx - r, cy - r * 0.9), (cx + r, cy - r * 0.9),
+           (cx + r, cy + r * 0.1), (cx, cy + r), (cx - r, cy + r * 0.1)]
+    d.polygon([(q(x), q(y)) for (x, y) in pts], fill=255)
+
+
+def _halfring(d, cx, cy, r_out, r_in):
+    # C 形半环：外圆 - 内圆 - 右侧开口矩形（开放弧，测弧连续性）。
+    d.ellipse([q(cx - r_out), q(cy - r_out), q(cx + r_out), q(cy + r_out)], fill=255)
+    d.ellipse([q(cx - r_in), q(cy - r_in), q(cx + r_in), q(cy + r_in)], fill=0)
+    d.rectangle([q(cx + r_in), q(cy - r_out), q(cx + r_out + 5), q(cy + r_out)], fill=0)
+
+
+def _flower(d, cx, cy, rp, rc):
+    # 花朵：中心圆 + 5 瓣（圆并集，瓣间凹陷为 cusp）。
+    d.ellipse([q(cx - rc), q(cy - rc), q(cx + rc), q(cy + rc)], fill=255)
+    for i in range(5):
+        a = -math.pi / 2 + i * 2 * math.pi / 5
+        px, py = cx + rp * math.cos(a), cy + rp * math.sin(a)
+        d.ellipse([q(px - rp), q(py - rp), q(px + rp), q(py + rp)], fill=255)
+
+
 def build():
     imgs = {}
 
@@ -323,13 +373,54 @@ def build():
     c = add(c, lambda d: _rings(d, 100, 100, [80, 55, 30]), (149, 165, 166, 255))
     imgs["ic_rings3"] = c
 
+    # 18) ic_moon —— 月牙（两布尔圆差，交点 cusp）
+    c = canvas()
+    c = add(c, lambda d: _moon(d, 100, 100, 78, 34, -22), (241, 196, 15, 255))
+    imgs["ic_moon"] = c
+
+    # 19) ic_bolt —— 闪电（尖锐锯齿多边形）
+    c = canvas()
+    c = add(c, lambda d: _bolt(d, 100, 100, 130), (241, 196, 15, 255))
+    imgs["ic_bolt"] = c
+
+    # 20) ic_arrow —— 右箭头（矩形杆 + 三角头）
+    c = canvas()
+    c = add(c, lambda d: _arrow(d, 100, 100, 150, 90), (231, 76, 60, 255))
+    imgs["ic_arrow"] = c
+
+    # 21) ic_plus —— 加号（凹多边形，直角）
+    c = canvas()
+    c = add(c, lambda d: _plus(d, 100, 100, 150, 46), (46, 204, 113, 255))
+    imgs["ic_plus"] = c
+
+    # 22) ic_shield —— 盾牌（平顶 + 尖点）
+    c = canvas()
+    c = add(c, lambda d: _shield(d, 100, 100, 80), (52, 152, 219, 255))
+    imgs["ic_shield"] = c
+
+    # 23) ic_halfring —— C 形半环（开放弧）
+    c = canvas()
+    c = add(c, lambda d: _halfring(d, 100, 100, 80, 50), (155, 89, 182, 255))
+    imgs["ic_halfring"] = c
+
+    # 24) ic_gradient_capsule —— 渐变胶囊（渐变 + 胶囊）
+    c = canvas()
+    c = add(c, lambda d: _capsule(d, 100, 100, 150, 80), vgrad((52, 152, 219), (155, 89, 182)))
+    imgs["ic_gradient_capsule"] = c
+
+    # 25) ic_flower —— 花朵（圆并集，瓣间 cusp）
+    c = canvas()
+    c = add(c, lambda d: _flower(d, 100, 100, 40, 26), (231, 76, 60, 255))
+    imgs["ic_flower"] = c
+
     for name, im in imgs.items():
         out = im.resize((N, N), Image.LANCZOS)
         path = os.path.join(OUT, f"{name}.png")
         out.save(path)
         print("wrote", path)
+    return len(imgs)
 
 
 if __name__ == "__main__":
-    build()
-    print("done:", len(imgs), "icons in", OUT)
+    n = build()
+    print("done:", n, "icons in", OUT)
