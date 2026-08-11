@@ -47,7 +47,9 @@ intellijPlatform {
     }
 
     // 发布到 JetBrains 插件市场（release 工作流设置 JETBRAINS_MARKETPLACE_TOKEN 后生效）
-    publishPlugin {
+    // 2.x DSL：token/channels 是 intellijPlatform.publishing 扩展属性，作为 publishPlugin 任务的默认值。
+    // 注意 publishPlugin 本身是任务，不能直接写在 intellijPlatform {} 下（否则报 receiver type mismatch）。
+    publishing {
         token.set(providers.environmentVariable("JETBRAINS_MARKETPLACE_TOKEN").orElse(""))
         channels.set(listOf(providers.gradleProperty("pluginChannel").getOrElse("default")))
     }
