@@ -55,6 +55,10 @@ logs/
 *.swo
 *~
 
+# ===== Training artifacts (large, keep locally) =====
+runs/**/*.pt
+runs/**/*.jsonl
+
 # ===== Test Coverage =====
 coverage/
 .nyc_output/

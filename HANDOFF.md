@@ -1,7 +1,7 @@
 # PNG→SVG 矢量化模型 — 交接文档（GPU 训练切换指南）
 
 > 用途：在 GPU 环境开新会话/换机器训练时，把本文件作为上下文输入。
-> 状态：Phase 1 / Phase 2 全部完成并验证；**剩余工作只有训练时长**（需 GPU）。
+> 状态：Phase 1 / Phase 2 完成并验证；**20k 步 GPU 训练已完成**（结果见 §7）；剩余为质量收敛与泛化。
 
 ---
 
@@ -100,22 +100,80 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - `slots_to_objs` 返回**元组** `(objs, bg)`，不要整个传给 `_render_objs`
 
 ## 5. 剩余差距（后续阶段）
-1. 质量收敛：20k 步 @256px GPU 训练（本文件 §4 即可启动）
+1. ~~质量收敛：20k 步 @256px GPU 训练~~ → **已完成，见 §7.2**（mae 0.0695，未达 <0.05；继续加步数收益已饱和，应按 §7.4 治门控/数据）
 2. 训练/生成分布 = SceneGenerator 分布；真实图片泛化需扩充数据管线
 3. AMP 混合精度、多卡（可选提速，未实现）
 4. Rust/WASM 部署侧（导出/推理移植，未开始）
+5. 推理侧冗余剪枝（§7.4 修法 1，可直接提升输出 SVG 洁净度）
 
 ## 6. 关键文件索引
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
-model/network.py    VectorNet（4.70M）
-model/losses.py     compute_losses / render_losses / auxiliary_losses
-dataset/renderer.py SoftSVGRenderer（可微；grad_checkpoint 开关；device 参数）
-dataset/generator.py SceneGenerator（在线数据）
-svg/serializer.py   serialize(scene)->str
-svg/render.py       render_scene_resvg（评估用真实渲染）
+benchmarks/profile_step.py  单步分段计时 + 显存峰值（新增）
+benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（新增）
 train.py            训练入口（--device cuda 即 GPU 训练）
 evaluate.py         评估入口（CPU 全链路 + 耗时）
 HANDOFF.md          本文件
 ```
+
+---
+
+## 7. 本地 GPU 实测结果（2026-09-08，GTX 1050 Ti 4GB）
+
+> 以下为本机真机实测，取代 §4.4 中“GPU 预计数十 it/s”的乐观估计。
+
+### 7.1 环境
+- 显卡 **GTX 1050 Ti 4GB**（Pascal sm_61），全机仅 1 块；`nvidia-smi` 报 NVML 初始化失败属正常，不影响 torch CUDA。
+- torch 必须锁 **2.7.1+cu126**：torch 2.8/cu128 起官方轮子移除 Pascal 支持。
+- venv：`C:/Users/Administrator/.workbuddy/binaries/python/envs/png2svg`。
+
+### 7.2 20k 步训练结果（HANDOFF 剩余任务 #1 已完成）
+启动命令（200 步冒烟确认后全量；中途暂停出门 1 次，靠 checkpoint 无缝续训）：
+```bash
+python -u train.py --steps 20000 --size 256 --sub-px 2 --device cuda \
+  --warmup 500 --log-every 50 --ckpt-every 1000 --out runs/gpu
+# 续训：加 --resume runs/gpu/last.pt（cosine 按 step 位置重算，衔接平滑）
+```
+
+| 指标 | CPU-185 基线 | GPU 20k | 说明 |
+|---|---|---|---|
+| mae_mean | 0.2088 | **0.0695** | 3.0× 改善 |
+| ssim_mean | 0.7186 | **0.8951** | +0.18 |
+| floor_mean | 0.0036 | 0.0027 | 量化地板 |
+| CPU 推理 median / max | 20.6 / 58.7 ms | 26.7 / 74.8 ms | 硬指标 <1s ✅ |
+| under_1s_ratio | 1.0 | **1.0** | ✅ |
+
+产物：`runs/gpu/last.pt`、`runs/gpu/log.jsonl`、`runs/eval_gpu20k_rerun.json`。
+曲线：mae 1–2k 步 0.126 → 16k 步后 0.072 后趋平，17k 与 20k 评估几乎一致——**再加步数收益已饱和**。
+
+### 7.3 性能瓶颈与提速配置（实测）
+`benchmarks/profile_step.py` 分段结果（sub_px=2 + ckpt，独占 GPU 约 1.35 s/步）：
+backward 44%（含 checkpoint 重算）、GT 渲染 18%、可微渲染 16%、**slots_to_objs 14%（纯 CPU，GPU 空等）**、net forward 7%。
+根因：batch=1 + 逐对象 Python 循环 → kernel launch 与 CPU 段主导，GPU 算力远未吃满。
+
+| 配置 | it/s | 显存峰值 | 20k 步 ETA |
+|---|---|---|---|
+| sub_px=2 + ckpt（本次实际） | 0.74 | 1.85 GiB | 7.5 h |
+| sub_px=1 + ckpt | 2.06 | 0.52 GiB | 2.7 h |
+| **sub_px=1 + --no-grad-checkpoint** | **2.73** | 3.47 GiB | **~2 h** |
+| sub_px=2 + --no-grad-checkpoint | OOM（需 6.68 GiB） | — | 4GB 卡不可用 |
+
+建议：**下一轮训练用 `--sub-px 1 --no-grad-checkpoint`**（3.7× 提速），先用 2k 步冒烟确认 sub_px=1 的收敛无退化再放全量。
+
+### 7.4 门控诊断（对象数预测不准）
+`benchmarks/diag_gate.py` @20k ckpt，30 场景：精确匹配 10/30、**多预测 13、少预测 7**，pred 4.37 vs gt 4.00。
+- valid 概率呈双峰（<0.1 共 76 个、>0.9 共 77 个），边缘区间 0.3–0.7 仅 17.9% → **不是阈值/区分度问题**。
+- 把多余 slot 裁掉后 mae 0.06897 → 0.06895（Δ≈0）→ **多预测的 slot 对渲染几乎无贡献**（被遮挡或低不透明度），属无害冗余。
+- 少预测来自**被完全遮挡的对象**：输入图中不可见，物理上无法预测，却计入 GT 与损失。
+- 已排除 slot 排列歧义：`encode_scene` 的 GT 按面积降序分配，顺序可学习。
+
+可选修法（按性价比）：
+1. **推理侧冗余剪枝**（不需重训）：用渲染器 `keep_layers` 分层输出算各对象贡献，剔除贡献低于阈值的 slot；实测质量几乎无损，可直接让输出 SVG 变干净。
+2. 数据侧：生成时剔除被完全遮挡的对象，或对其不计 valid 损失。
+3. 训练侧：提高 `w_valid`（当前 0.1）让多预测代价更大。
+
+### 7.5 实测注意点
+- **评估必须在训练空闲时跑**：与训练并行时曾出现单场景 2915 ms 的假性超时（CPU 争抢），空闲重跑 max 仅 74.8 ms。
+- 沙箱/前台跑长任务会被 SIGTERM，但 python 子进程可能存活继续写日志——重启前先 `tasklist` 确认，避免两进程同写一个 log/checkpoint。
+- 日志在实时写 `runs/*/log.jsonl`；`tail -f` 经管道会缓冲，直接读文件。
