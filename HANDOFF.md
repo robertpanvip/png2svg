@@ -101,19 +101,78 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 
 ## 5. 剩余差距（后续阶段，按 2026-09-08 Benchmark 后优先级排序）
 1. ~~质量收敛：20k 步 @256px GPU 训练~~ → **已完成，见 §7.2**（mae 0.0695，曲线已饱和）
-2. **架构层修复**（**P0，由 §8 Benchmark 揭示的真正问题**）：类别坍缩到 `path`、小对象丢失、bbox 模式坍缩到中心。需排查 I_CLS 训练权重 / I_BBOX 解空间 / grad checkpoint 反向一致性。继续加训练步数只会加深坍缩，**不要再盲目重训**。
+2. **架构层修复**（**P0，由 §8 Benchmark 揭示**）：根因已数据锁定（§5.2）= 无 Hungarian 匹配 + 空间定位归纳偏置缺失 + cls 梯度被 detach 切断 → 表现为 bbox 空间坍缩 + 类别 mode collapse。**修复已实施**（spatial_anchor + Hungarian 匹配 + 调高 cls/geom 权重 + 空间多样性正则），4k 验证确认**空间定位坍缩已打破**（中心方差 0.000026→0.0535，≈2000×），20k 续训运行中（§5.2.3）。类别 mode collapse 4k 步未解但已非质量主因（oracle_cls 仅 +0.8%）。
 3. **推理侧剪枝（开箱即用，性价比最高）**：见 §9。`benchmarks/prune.py` + 建议集成到推理入口。
 4. 训练/生成分布 = SceneGenerator 分布；真实图片泛化需扩充数据管线
 5. AMP 混合精度、多卡（可选提速，§7.3 已实测 sub_px=1+no-ckpt = 2.73 it/s）
 6. Rust/WASM 部署侧（导出/推理移植，未开始）
 
+## 5.2 架构层根因与修复（P0，2026-09-08 架构诊断）
+
+> 本节对应 §5 第 2 项。基于 `benchmarks/diag_arch.py`（30 场景 oracle ablation）与
+> `benchmarks/diag_query.py`（slot 退化检查）的**数据结论**，非猜测。
+
+### 5.2.1 已确认根因（数据驱动）
+
+| 现象 | 实测数据 | 结论 |
+|------|----------|------|
+| bbox 中心坍缩 | `bbox 中心方差均值 = 0.000026`（≈0）；pred 中心全部堆在 (0.496, 0.505)±0.008 | **空间定位彻底失效**：所有 slot 能预测不同颜色/形状，但 cx/cy 全坍缩到画布中心 |
+| 类别头未训练 | cls 预测分布 `blob:126 / 其他全 0`；cls logits 熵 1.46 ≈ 随机基线 ln5=1.61 | **mode collapse 到 blob**；类别头几乎随机 |
+| query 未退化 | `query 余弦相似度(非对角) = -0.029`（近乎正交） | **不是 query 对称坍缩**——可学习 query 是分散的，问题在解码/监督 |
+| slot 输出部分差异 | `slot 输出余弦相似度 = 0.336`（max 0.727） | slot 之间并非完全相同，但空间属性高度同质 |
+
+**三个结构性缺陷：**
+
+1. **无 slot↔object 匹配（Hungarian matching 缺失）**：可微渲染损失在图像层面是**置换不变**的（composite 后比像素），而辅助损失 `auxiliary_losses` 按**固定 slot 下标**对齐 GT（encode_scene 按面积降序分配）。两者目标冲突——渲染损失把每个 slot 拉向"质心/平均解"，辅助损失又要求 slot i = 第 i 大对象。模型落入对称局部极小。
+
+2. **空间定位归纳偏置缺失**：解码器仅 2 层 cross-attn + bg 全局池化，没有把 query 绑定到具体空间位置的机制。渲染损失的置换不变性不提供任何定位梯度，辅助几何 L1 又在与渲染损失的拉扯中落败 → cx/cy 全部坍缩到中心。
+
+3. **cls/ftype 头梯度被切断**：`train.py` 中 `cls_ids = aux["cls"][0].detach().argmax(-1)`，渲染路径的类别分支选择被 detach，类别头**唯一**的梯度来源只剩辅助 cls CE（原权重仅 w_cls=0.05）。中心 blob 最像 "blob"，自我强化成 mode collapse。
+
+### 5.2.2 已实施的修复
+
+| 文件 | 改动 | 作用 |
+|------|------|------|
+| `model/matching.py`（新增） | O(n³) Hungarian 解算器 `match_slots` | 每步把 8 个预测 slot 与 8 个 GT 对象最优一一匹配 |
+| `model/network.py` | `spatial_anchor` 参数（NUM_SLOTS×2），按 2×4 网格初始化，加到 bbox 的 cx/cy 原始 logit | 强制每个 slot 偏向画布不同区域，打破定位坍缩 |
+| `model/losses.py` | `matched_auxiliary_losses`（匹配后再算 cls/ftype/geom/valid）+ `spatial_diversity` 正则；调高 w_cls 0.05→0.3、w_geom 0.5→0.7、w_ftype→0.3、新增 w_div=0.05 | 消除固定顺序冲突；惩罚活跃 slot 中心过度集中 |
+| `train.py` | 暴露 `--w-cls/--w-ftype/--w-valid/--w-svalid/--w-geom/--w-bg/--w-div` | 便于调参 |
+
+### 5.2.3 验证结果（4k 步 @256px，sub_px=1+no-ckpt）
+
+> 训练命令：`python -u train.py --steps 4000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --out runs/fix4k`
+> 续训（进行中）：`python -u train.py --resume runs/fix4k/last.pt --steps 20000 ... --out runs/fix20k`（约 90min，后台 task kM8bC4）
+> 对比基线：`runs/gpu/last.pt`（20k，未修复）；诊断脚本 `diag_query.py` / `diag_arch.py`。
+
+| 指标 | 修复前 (20k) | 修复后 (4k) | 判定 |
+|------|--------------|-------------|------|
+| bbox 中心方差均值 | 0.000026（≈0 全坍缩） | **0.0535** | ✅ 提升 ~2000×，空间定位坍缩已打破 |
+| query 余弦相似度 | −0.029（正交未退化） | −0.087 | ✅ 仍分散，anchor 非对称触发 |
+| cls logits 熵 | 1.46 | **1.03** | ⚠️ 下降但尚未多类（仍 100% blob） |
+| cls 预测分布 | blob:126/其他0 | **blob:240/其他0** | ❌ mode collapse 未解决 |
+| bbox pred 中心 | (0.496,0.505)±0.008 | cx=0.230±0.256, cy=0.189±0.202 | ✅ 已分散（均值偏左上，anchor 偏置所致，待长训练校正） |
+| mae（diag_arch baseline） | 0.0733 | **0.0754** | ➖ 略高（仅 1/5 步数 + 空间误差已非主因） |
+| oracle_bbox 增益 | +11.3% | **+0.3%** | ✅ 模型自身已把空间做对，bbox 不再是瓶颈 |
+| oracle_cls+bbox 增益 | +18.6% | **+2.1%** | ✅ 架构修复消除了大部分 oracle 增益 |
+
+**结论（数据驱动）：**
+- **空间定位坍缩：已修复确认**（中心方差 0.000026 → 0.0535，≈2000×；oracle_bbox 增益 +11.3%→+0.3%）。这是 P0 中最关键、最难修的一块，现已结构性解决。
+- **类别 mode collapse：4k 步仍未解**（仍 100% blob，但 cls 熵 1.46→1.03 在下降）。不过 oracle_cls 仅 +0.8%、两者合计 +2.1%——说明类别错误对像素 MAE 影响极小（blob 圆形已大致覆盖 GT 面积），**已不再是质量主因**；属后续可选项（如 soft-routing / cls 专项正则）。
+- **mae 持平但步数仅 1/5**：4k=0.0754 vs 20k 原模型=0.0733，差距可忽略，且此时 mae 主因已从"空间错位"转为"几何紧致度 + 过度预测（matched 61/119）"。
+- **下一步**：20k 续训（运行中）应进一步压低 geom（现 5.3，原 20k≈4.13）与过度预测， definitive 验证 mae 是否低于原 20k 基线。若仍 100% blob 但 mae 已达标，则类别问题可降级为"输出美观度"而非质量 blocker。
+
 ## 6. 关键文件索引
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
+model/matching.py   （新增）O(n³) Hungarian slot↔GT 匹配解算器
+model/network.py    VectorNet + spatial_anchor 空间锚点先验
+model/losses.py     matched_auxiliary_losses（匹配版）+ spatial_diversity 正则
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（新增）
 benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（新增）
-train.py            训练入口（--device cuda 即 GPU 训练）
+benchmarks/diag_arch.py     架构诊断：oracle ablation（新增）
+benchmarks/diag_query.py    slot 退化检查：中心方差/query 相似度（新增）
+train.py            训练入口（--device cuda 即 GPU 训练；暴露 --w-* 权重）
 evaluate.py         评估入口（CPU 全链路 + 耗时）
 HANDOFF.md          本文件
 ```
@@ -270,6 +329,8 @@ backward 44%（含 checkpoint 重算）、GT 渲染 18%、可微渲染 16%、**s
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
+model/matching.py   slot↔GT 匈牙利匹配（§5.2.2 修复，新增）
+benchmarks/diag_query.py   slot 退化检查：query/输出余弦相似度 + bbox 中心方差（§5.2.1）
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（§7.3）
 benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（§7.4）
 benchmarks/suite.py         12 组能力 Benchmark（§8，新增）

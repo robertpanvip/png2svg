@@ -1,0 +1,27 @@
+{
+  "num_slots": 8,
+  "query_cos_sim_mean_offdiag": -0.0873270978530248,
+  "query_cos_sim_max_offdiag": 0.3475961685180664,
+  "slot_head_weight_std": 0.03904922679066658,
+  "slot_head_weight_norm": 5.1141486167907715,
+  "slot_head_bias_norm": 0.3405490219593048,
+  "slot_head_bias_I_BBOX": [
+    -0.04455479606986046,
+    0.031238509342074394,
+    -0.00845873448997736,
+    -0.06147170439362526
+  ],
+  "cls_head_bias": [
+    -0.029759254306554794,
+    0.02688693441450596,
+    -0.011947725899517536,
+    -0.0615726076066494,
+    -0.01870664767920971
+  ],
+  "cls_head_bias_std": 0.03195159509778023,
+  "forward_slot_out_cos_sim_mean": 0.8938967939008841,
+  "forward_slot_out_cos_sim_max": 0.9801929923040527,
+  "per_scene_active_slots_mean": 8.0,
+  "bbox_center_variance_mean": 0.053490571305155755,
+  "num_scenes": 20
+}

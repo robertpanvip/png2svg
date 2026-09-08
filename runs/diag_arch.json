@@ -1,0 +1,38 @@
+{
+  "ckpt": "runs/gpu/last.pt",
+  "suite": "mixed",
+  "num_scenes": 30,
+  "mae": {
+    "baseline": 0.07333516447494427,
+    "oracle_cls": 0.0718888683244586,
+    "oracle_bbox": 0.065038286584119,
+    "oracle_cls_bbox": 0.059724084474146365,
+    "oracle_valid": 0.07325535975396633
+  },
+  "mae_gain_vs_baseline": {
+    "oracle_cls": 0.0014462961504856792,
+    "oracle_bbox": 0.008296877890825269,
+    "oracle_cls_bbox": 0.013611080000797908,
+    "oracle_valid": 7.980472097794677e-05
+  },
+  "cls_pred_hist": {
+    "blob": 126,
+    "polygon": 1,
+    "ellipse": 0,
+    "rect": 0,
+    "stroke": 0
+  },
+  "cls_gt_hist": {
+    "blob": 52,
+    "polygon": 26,
+    "ellipse": 21,
+    "rect": 8,
+    "stroke": 12
+  },
+  "cls_entropy_mean": 1.4609163990170937,
+  "cls_max_entropy": 1.6094379124341003,
+  "bbox_pred": "pred: n=127 cx=0.496±0.008 cy=0.505±0.006 w=0.306±0.086 h=0.304±0.086",
+  "bbox_gt": "gt: n=119 cx=0.499±0.155 cy=0.480±0.176 w=0.336±0.130 h=0.314±0.134",
+  "matched_pairs": 117,
+  "gt_objects": 119
+}

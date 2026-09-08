@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.targets import NUM_SLOTS, SLOT_DIM, BG_DIM, NUM_CLS
+import math
+
+from model.targets import NUM_SLOTS, SLOT_DIM, BG_DIM, NUM_CLS, I_BBOX
 
 
 class ConvBlock(nn.Module):
@@ -93,6 +95,20 @@ class VectorNet(nn.Module):
         self.cls_head = nn.Linear(d_model, NUM_CLS)
         self.ftype_head = nn.Linear(d_model, 4)
         self.bg_head = nn.Linear(d_model, BG_DIM)
+        # 空间锚点先验：强制每个 slot 偏向画布不同区域，打破 bbox 中心坍缩。
+        # 加到 bbox 的 cx/cy 原始 logit 上（squash 用 _lin 把 logit 映射到 [-0.2,1.2]）。
+        self.spatial_anchor = nn.Parameter(torch.zeros(num_slots, 2))
+        C_MIN, C_MAX = -0.20, 1.20
+        cols, rows = 4, 2
+        with torch.no_grad():
+            for k in range(num_slots):
+                r, c = divmod(k, cols)
+                gx = (c + 0.5) / cols          # 期望中心（canvas 坐标 0..1）
+                gy = (r + 0.5) / rows
+                ax = math.log((gx - C_MIN) / (C_MAX - gx))   # logit 逆变换
+                ay = math.log((gy - C_MIN) / (C_MAX - gy))
+                self.spatial_anchor[k, 0] = ax
+                self.spatial_anchor[k, 1] = ay
         n_params = sum(p.numel() for p in self.parameters())
         assert 3_000_000 <= n_params <= 8_000_000, f"param budget violated: {n_params}"
 
@@ -109,6 +125,7 @@ class VectorNet(nn.Module):
             q = layer(q, tokens)
         h = self.final_norm(q)
         slots = self.slot_head(h)
+        slots[..., I_BBOX:I_BBOX + 2] = slots[..., I_BBOX:I_BBOX + 2] + self.spatial_anchor
         aux = {"cls": self.cls_head(h), "ftype": self.ftype_head(h)}
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg
