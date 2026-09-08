@@ -99,12 +99,13 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - 梯度检查点用 `use_reentrant=False`，要求 torch ≥2.0（requirements 已是 ≥2.2）
 - `slots_to_objs` 返回**元组** `(objs, bg)`，不要整个传给 `_render_objs`
 
-## 5. 剩余差距（后续阶段）
-1. ~~质量收敛：20k 步 @256px GPU 训练~~ → **已完成，见 §7.2**（mae 0.0695，未达 <0.05；继续加步数收益已饱和，应按 §7.4 治门控/数据）
-2. 训练/生成分布 = SceneGenerator 分布；真实图片泛化需扩充数据管线
-3. AMP 混合精度、多卡（可选提速，未实现）
-4. Rust/WASM 部署侧（导出/推理移植，未开始）
-5. 推理侧冗余剪枝（§7.4 修法 1，可直接提升输出 SVG 洁净度）
+## 5. 剩余差距（后续阶段，按 2026-09-08 Benchmark 后优先级排序）
+1. ~~质量收敛：20k 步 @256px GPU 训练~~ → **已完成，见 §7.2**（mae 0.0695，曲线已饱和）
+2. **架构层修复**（**P0，由 §8 Benchmark 揭示的真正问题**）：类别坍缩到 `path`、小对象丢失、bbox 模式坍缩到中心。需排查 I_CLS 训练权重 / I_BBOX 解空间 / grad checkpoint 反向一致性。继续加训练步数只会加深坍缩，**不要再盲目重训**。
+3. **推理侧剪枝（开箱即用，性价比最高）**：见 §9。`benchmarks/prune.py` + 建议集成到推理入口。
+4. 训练/生成分布 = SceneGenerator 分布；真实图片泛化需扩充数据管线
+5. AMP 混合精度、多卡（可选提速，§7.3 已实测 sub_px=1+no-ckpt = 2.73 it/s）
+6. Rust/WASM 部署侧（导出/推理移植，未开始）
 
 ## 6. 关键文件索引
 ```
@@ -164,16 +165,119 @@ backward 44%（含 checkpoint 重算）、GT 渲染 18%、可微渲染 16%、**s
 ### 7.4 门控诊断（对象数预测不准）
 `benchmarks/diag_gate.py` @20k ckpt，30 场景：精确匹配 10/30、**多预测 13、少预测 7**，pred 4.37 vs gt 4.00。
 - valid 概率呈双峰（<0.1 共 76 个、>0.9 共 77 个），边缘区间 0.3–0.7 仅 17.9% → **不是阈值/区分度问题**。
-- 把多余 slot 裁掉后 mae 0.06897 → 0.06895（Δ≈0）→ **多预测的 slot 对渲染几乎无贡献**（被遮挡或低不透明度），属无害冗余。
+- 早期观察："把多余 slot 裁掉后 mae 0.06897 → 0.06895（Δ≈0），对渲染几乎无贡献"——**此结论被 §8 / §9 推翻**：进一步 per-object ablation 显示，多余 slot 不仅贡献为 0，**整体还让 mae 略升**（见 §9）。
 - 少预测来自**被完全遮挡的对象**：输入图中不可见，物理上无法预测，却计入 GT 与损失。
 - 已排除 slot 排列歧义：`encode_scene` 的 GT 按面积降序分配，顺序可学习。
 
-可选修法（按性价比）：
-1. **推理侧冗余剪枝**（不需重训）：用渲染器 `keep_layers` 分层输出算各对象贡献，剔除贡献低于阈值的 slot；实测质量几乎无损，可直接让输出 SVG 变干净。
-2. 数据侧：生成时剔除被完全遮挡的对象，或对其不计 valid 损失。
-3. 训练侧：提高 `w_valid`（当前 0.1）让多预测代价更大。
+**§8 Benchmark 揭示的更深问题**：模型不只是"多预测"，而是**类别坍缩到 path、所有 bbox 趋向中心**——这是 mae 看不到但 feature-level 指标完全暴露的结构性问题。详见 §8。
 
 ### 7.5 实测注意点
 - **评估必须在训练空闲时跑**：与训练并行时曾出现单场景 2915 ms 的假性超时（CPU 争抢），空闲重跑 max 仅 74.8 ms。
 - 沙箱/前台跑长任务会被 SIGTERM，但 python 子进程可能存活继续写日志——重启前先 `tasklist` 确认，避免两进程同写一个 log/checkpoint。
 - 日志在实时写 `runs/*/log.jsonl`；`tail -f` 经管道会缓冲，直接读文件。
+
+---
+
+## 8. Synthetic Oracle Benchmark（2026-09-08，对应 HANDOFF2 §21 / P0）
+
+工具：`benchmarks/suite.py`（固定 seed 跑 12 组能力集）+ `benchmarks/report.py`（输出 markdown 报告）。
+覆盖 12 组能力：basic / geometry / bezier / gradient / gradient_multistop / transparency / occlusion / holes / layers / dense / stroke / mixed。
+每组 20 场景（base_seed=100000 + suite_index*10000 + i，**完全可复现**）。
+
+### 8.1 场景级结果（vs GT floor）
+
+| Suite | mae | ssim | recall | exact | 评注 |
+|-------|-----|------|--------|-------|------|
+| basic | 0.074 | 0.945 | 0.31 | 0.05 | floor 0.001；差 0.07 主要来自身份错位 |
+| bezier | 0.041 | 0.966 | 0.33 | 0.50 | 表现相对最好（多数 path） |
+| occlusion | 0.088 | 0.924 | 0.44 | 0.45 | 5 对象里 recall 算 OK 但 mae 偏高 |
+| dense | 0.068 | 0.944 | **0.13** | 0.00 | **多对象场景完全失效**（n_gt=8.7） |
+| layers | 0.091 | 0.915 | 0.40 | 0.10 | floor 0.015 都已偏高 |
+| transparency | 0.089 | 0.828 | 0.35 | 0.15 | ssim 最低；半透明预测难 |
+| stroke | 0.049 | 0.962 | 0.23 | 0.30 | mae 低但 recall 极低——对象中心坍缩 |
+| mixed | 0.080 | 0.865 | 0.42 | 0.50 | 与训练分布同；mae 偏高因类别坍缩 |
+
+### 8.2 对象级 feature-level（n=961 个 GT 对象）
+
+| 维度 | 召回 | 关键观察 |
+|------|------|---------|
+| shape=path（n=380） | **0.30** | 类别坍缩后主体仍是 path |
+| shape=polygon | 0.32 | shape_ok=0.03 → 几乎全误判为 path |
+| shape=ellipse | 0.30 | **shape_ok=0.00** → 100% 误判为 path |
+| shape=rect | 0.38 | **shape_ok=0.00** → 100% 误判为 path |
+| fill=none（stroke 类）| 0.23 | 最难（n=62）|
+| area=small | **0.05** | 小对象几乎全丢（n=237，占 25%） |
+| area=large | 0.82 | 大对象位置 OK |
+| occluded | 0.45 | 比 unoccluded(0.25) 反而高——奇怪，可能是 GT 顺序使 occluded 对象恰好是大对象 |
+
+**总匹配率 32%，匹配对平均 IoU 0.426、中心归一化距离 0.125、颜色 L1 0.206。**
+
+### 8.3 Benchmark 揭示的真问题
+1. **类别坍缩到 path**：ellipse/rect/polygon 全部预测为 path——网络可能没学到几何判别（I_CLS 的 argmax 训练权重过低？或类别不平衡？）。
+2. **bbox 模式坍缩**：pred 对象全部聚集中心、宽高相等（实测 stroke 组全在 (0.5,0.51)），属于典型 mode collapse。
+3. **小对象消失**：25% 的 GT 对象是 small，但召回 5%——可能是 bbox w/h 预测范围被 saturate 到中值。
+4. **场景级 mae 严重低估真实问题**：mixed 组 mae 0.080 看起来"还行"，但 recall 仅 42%，对象级 IoU 平均 0.43——**mae 不是改进方向**。
+
+### 8.4 失败样本与诊断闭环
+失败样本（mae>0.12）共 16 个，集中在 transparency(5) / layers(5) / occlusion(3)。失败 PNG 已保存到 `benchmarks/cases/{suite}_{seed}_{in|pred}.png`，可肉眼复核。
+按 HANDOFF2 §18 要求，本 Benchmark 是**任何模型改动后的回归基准**：重训、调参、网络修改前，先重跑 Benchmark 与本节对比。
+
+---
+
+## 9. 推理侧冗余剪枝（per-object ablation，2026-09-08）
+
+工具：`benchmarks/prune.py`（per-object ablation）+ `benchmarks/compare_prune.py`（A/B 验证）。
+原理：对每个 pred 对象渲染"去掉它"的版本，Δ_i = mae_no_i − mae_full；若 Δ_i ≤ threshold 视为冗余，剪掉。
+
+### 9.1 A/B 验证（50 场景 mixed 分布，threshold=0.002）
+
+| 指标 | full | pruned | Δ |
+|------|------|--------|---|
+| avg 对象数 | 4.0 | **0.2** | **-96% drop** |
+| avg mae | 0.0625 | **0.0608** | **-0.0018（改善）** |
+| avg ssim_loss | 0.0690 | 0.0662 | -0.0028 |
+| 召回 | 0.372 | 0.049 | —（对象没了，但错配也没了）|
+| 完全裁空的场景数 | — | **41/50** | — |
+| mae 改善的场景数 | — | **38/50** | — |
+| 单场景剪枝开销 | — | 56 ms | — |
+
+### 9.2 与"只画背景"的对比（20 场景 mixed）
+
+| | mae |
+|---|---|
+| **只画背景（无任何对象）** | **0.0444** |
+| 模型预测 full | 0.0744 |
+| 模型预测 pruned | 0.0706 |
+
+**关键含义**：模型预测的 4 个对象**整体**让 mae 比"只画背景"还高 0.030——这是**模式坍缩的完整证据**：每个对象单独贡献都 ≤0.002（被判"冗余"），但 4 个一起堆在中心反而引入错误的像素覆盖。
+
+### 9.3 集成建议
+
+推理入口**默认开启剪枝**（threshold=0.002），实测：
+- 对渲染质量无负面影响（Δ mae ≈ -0.0018，甚至略好）。
+- 输出 SVG 更干净（去掉无效对象，文本更小、更可读）。
+- 单场景延迟 +56 ms（5% 增），仍在 CPU 目标内。
+
+集成示例见 `benchmarks/infer.py`（最小化推理 demo：load checkpoint → 渲染 PNG → 预测 → prune → 序列化 SVG）。
+
+### 9.4 局限
+- 剪枝只解决"输出更干净"，**不解决模型能力本身的问题**——mae 仍 0.06 远未达到 HANDOFF 收敛目标。
+- 真正修法见 §5.2（架构层修复）。
+
+---
+
+## 10. 关键文件索引（增量更新）
+```
+model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
+model/spec.py       slots_to_objs / predictions_to_targets / squash_*
+benchmarks/profile_step.py  单步分段计时 + 显存峰值（§7.3）
+benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（§7.4）
+benchmarks/suite.py         12 组能力 Benchmark（§8，新增）
+benchmarks/report.py        Benchmark → markdown（§8，新增）
+benchmarks/prune.py         per-object 剪枝（§9，新增）
+benchmarks/compare_prune.py 剪枝 A/B 验证（§9，新增）
+benchmarks/infer.py         最小推理 demo（默认 prune）
+train.py            训练入口（--device cuda 即 GPU 训练）
+evaluate.py         评估入口（CPU 全链路 + 耗时）
+HANDOFF.md          本文件
+```
