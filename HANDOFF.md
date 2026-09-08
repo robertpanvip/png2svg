@@ -101,7 +101,7 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 
 ## 5. 剩余差距（后续阶段，按 2026-09-08 Benchmark 后优先级排序）
 1. ~~质量收敛：20k 步 @256px GPU 训练~~ → **已完成，见 §7.2**（mae 0.0695，曲线已饱和）
-2. **架构层修复**（**P0，由 §8 Benchmark 揭示**）：根因已数据锁定（§5.2）= 无 Hungarian 匹配 + 空间定位归纳偏置缺失 + cls 梯度被 detach 切断 → 表现为 bbox 空间坍缩 + 类别 mode collapse。**修复已实施**（spatial_anchor + Hungarian 匹配 + 调高 cls/geom 权重 + 空间多样性正则），4k 验证确认**空间定位坍缩已打破**（中心方差 0.000026→0.0535，≈2000×），20k 续训运行中（§5.2.3）。类别 mode collapse 4k 步未解但已非质量主因（oracle_cls 仅 +0.8%）。
+2. **架构层修复**（**P0，由 §8 Benchmark 揭示**）：根因已数据锁定（§5.2）= 无 Hungarian 匹配 + 空间定位归纳偏置缺失 + cls 梯度被 detach 切断 → 表现为 bbox 空间坍缩 + 类别 mode collapse。**修复已实施并验证**：spatial_anchor + Hungarian 匹配 + 调高 cls/geom 权重 + 空间多样性正则；20k 训练（§5.2.3）确认**空间定位坍缩已彻底打破**（中心方差 0.000026→0.048，匹配 GT 数 61→90/119），但暴露**新问题：2×4 硬网格锚点过刚性（网格偏置，oracle_bbox 4k +0.3%→20k +8.3%）**。类别 mode collapse 仍在但已非质量主因（oracle_cls +2.3%）。**下一步：软化空间锚点（缩小尺度 / warmup 后退火 / 改软正则）以消除网格偏置，目标 mae<0.0733**（§5.2.4）。
 3. **推理侧剪枝（开箱即用，性价比最高）**：见 §9。`benchmarks/prune.py` + 建议集成到推理入口。
 4. 训练/生成分布 = SceneGenerator 分布；真实图片泛化需扩充数据管线
 5. AMP 混合精度、多卡（可选提速，§7.3 已实测 sub_px=1+no-ckpt = 2.73 it/s）
@@ -138,28 +138,41 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 | `model/losses.py` | `matched_auxiliary_losses`（匹配后再算 cls/ftype/geom/valid）+ `spatial_diversity` 正则；调高 w_cls 0.05→0.3、w_geom 0.5→0.7、w_ftype→0.3、新增 w_div=0.05 | 消除固定顺序冲突；惩罚活跃 slot 中心过度集中 |
 | `train.py` | 暴露 `--w-cls/--w-ftype/--w-valid/--w-svalid/--w-geom/--w-bg/--w-div` | 便于调参 |
 
-### 5.2.3 验证结果（4k 步 @256px，sub_px=1+no-ckpt）
+### 5.2.3 验证结果（4k + 20k 步 @256px，sub_px=1+no-ckpt）
 
-> 训练命令：`python -u train.py --steps 4000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --out runs/fix4k`
-> 续训（进行中）：`python -u train.py --resume runs/fix4k/last.pt --steps 20000 ... --out runs/fix20k`（约 90min，后台 task kM8bC4）
-> 对比基线：`runs/gpu/last.pt`（20k，未修复）；诊断脚本 `diag_query.py` / `diag_arch.py`。
+> 训练命令：
+> - 4k：`python -u train.py --steps 4000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --out runs/fix4k`
+> - 20k：`python -u train.py --resume runs/fix4k/last.pt --steps 20000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --out runs/fix20k`（已完成，ckpt `runs/fix20k/last.pt`）
+> 对比基线：`runs/gpu/last.pt`（20k，未修复）；诊断脚本 `diag_query.py` / `diag_arch.py`；产物 `runs/diag_*_fix20k.json`。
 
-| 指标 | 修复前 (20k) | 修复后 (4k) | 判定 |
-|------|--------------|-------------|------|
-| bbox 中心方差均值 | 0.000026（≈0 全坍缩） | **0.0535** | ✅ 提升 ~2000×，空间定位坍缩已打破 |
-| query 余弦相似度 | −0.029（正交未退化） | −0.087 | ✅ 仍分散，anchor 非对称触发 |
-| cls logits 熵 | 1.46 | **1.03** | ⚠️ 下降但尚未多类（仍 100% blob） |
-| cls 预测分布 | blob:126/其他0 | **blob:240/其他0** | ❌ mode collapse 未解决 |
-| bbox pred 中心 | (0.496,0.505)±0.008 | cx=0.230±0.256, cy=0.189±0.202 | ✅ 已分散（均值偏左上，anchor 偏置所致，待长训练校正） |
-| mae（diag_arch baseline） | 0.0733 | **0.0754** | ➖ 略高（仅 1/5 步数 + 空间误差已非主因） |
-| oracle_bbox 增益 | +11.3% | **+0.3%** | ✅ 模型自身已把空间做对，bbox 不再是瓶颈 |
-| oracle_cls+bbox 增益 | +18.6% | **+2.1%** | ✅ 架构修复消除了大部分 oracle 增益 |
+| 指标 | 原 20k(未修复) | 修复 4k | 修复 20k | 解读 |
+|------|---------------|---------|----------|------|
+| bbox 中心方差均值 | 0.000026（≈0 全坍缩） | 0.0535 | **0.0478** | ✅ 空间坍缩已结构性打破（≈2000×） |
+| query 余弦相似度 | −0.029 | −0.087 | −0.102 | ✅ 仍分散，未退化 |
+| cls logits 熵 | 1.46 | 1.03 | **0.995** | ⚠️ 下降但仍 100% blob |
+| cls 预测分布 | blob:126 | blob:240 | blob:240 | ❌ mode collapse 未解（非质量主因） |
+| 匹配 GT 对象数 | — | 61/119 | **90/119** | ✅ 捕捉到的 GT 对象显著增加 |
+| mae（diag baseline） | **0.0733** | 0.0754 | 0.0769 | ➖ 略高于原基线 |
+| oracle_bbox 增益 | +11.3% | +0.3% | **+8.3%** | ⚠️ 20k 回升 → 网格偏置 |
+| oracle_cls+bbox 增益 | +18.6% | +2.1% | +16.2% | ➖ 上限略低于原模型 |
 
 **结论（数据驱动）：**
-- **空间定位坍缩：已修复确认**（中心方差 0.000026 → 0.0535，≈2000×；oracle_bbox 增益 +11.3%→+0.3%）。这是 P0 中最关键、最难修的一块，现已结构性解决。
-- **类别 mode collapse：4k 步仍未解**（仍 100% blob，但 cls 熵 1.46→1.03 在下降）。不过 oracle_cls 仅 +0.8%、两者合计 +2.1%——说明类别错误对像素 MAE 影响极小（blob 圆形已大致覆盖 GT 面积），**已不再是质量主因**；属后续可选项（如 soft-routing / cls 专项正则）。
-- **mae 持平但步数仅 1/5**：4k=0.0754 vs 20k 原模型=0.0733，差距可忽略，且此时 mae 主因已从"空间错位"转为"几何紧致度 + 过度预测（matched 61/119）"。
-- **下一步**：20k 续训（运行中）应进一步压低 geom（现 5.3，原 20k≈4.13）与过度预测， definitive 验证 mae 是否低于原 20k 基线。若仍 100% blob 但 mae 已达标，则类别问题可降级为"输出美观度"而非质量 blocker。
+- **空间定位坍缩：已彻底修复**（中心方差 0.000026 → 0.048，稳定于 4k 与 20k；匹配 GT 数 61→90/119）。这是 P0 最关键、最难修的一块，已结构性解决。原 20k 模型"mae 0.0733 略优"是**假象**——它是把所有对象堆在画布中心 (0.5,0.5)±0.008 叠加出来的，输出 SVG 不可用；修复模型的对象是真实分散的。
+- **新暴露的问题：2×4 硬网格锚点过刚性（grid-bias）**。证据：oracle_bbox 增益在 4k 仅 +0.3%（模型位置已近似正确），但 20k 回升到 +8.3%——说明随着训练推进，锚点把对象"吸"向网格点 (cx∈{0.125,0.375,0.625,0.875})，与 matched 几何监督拉扯，反而损害了连续位置学习。pred 中心均值 cx=0.23（偏左上）即网格偏置的实证。
+- **类别 mode collapse 仍在**（100% blob），但 oracle_cls 仅 +2.3%——对像素 MAE 影响极小，已降级为"输出美观度"后续项，非质量 blocker。
+- **净评估**：修复把"不可用（全堆叠中心）"变成"可用（真实分散）"，但硬锚点的网格偏置使 mae 比原模型高 ~0.004。下一步应**软化锚点**以释放位置精度。
+
+### 5.2.4 下一步（待执行）：软化空间锚点，消除网格偏置
+
+> 目标：保留"打破坍缩"的能力，但允许对象学到任意连续位置，把 oracle_bbox 从 +8.3% 压回 ~0、mae 推到原基线 0.0733 以下。
+
+候选方案（按性价比排序）：
+1. **缩小锚点尺度**：`spatial_anchor` 初始化 std 从全幅（logit 映射 0.125~0.875）降到 ~0.3×，或 forward 中 `cx_logit = anchor*0.3 + delta`，让 delta 主导精细位置。
+2. **锚点仅作 warmup 先验**：前 N 步保留锚点打破对称，之后 `anchor_scale` 余弦退火到 0，交给 matched 几何损失自由学位置。
+3. **改用软空间多样性正则**：去掉 hard 位置偏移，保留 `spatial_diversity` 正则（`w_div`）防止回退到中心坍缩，避免网格锁定。
+4. 上述任一 + 继续训练 ~10–20k 步（sub_px=1+no-ckpt ≈ 2.7–3.1 it/s，约 60–90min）。
+
+验证：重跑 `diag_query`/`diag_arch`，看 (a) 中心方差仍 >0.01（坍缩未回退）、(b) oracle_bbox 增益回落到 ~1–2%、(c) mae < 0.0733。
 
 ## 6. 关键文件索引
 ```
