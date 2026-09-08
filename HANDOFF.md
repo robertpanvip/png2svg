@@ -162,17 +162,21 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - **类别 mode collapse 仍在**（100% blob），但 oracle_cls 仅 +2.3%——对像素 MAE 影响极小，已降级为"输出美观度"后续项，非质量 blocker。
 - **净评估**：修复把"不可用（全堆叠中心）"变成"可用（真实分散）"，但硬锚点的网格偏置使 mae 比原模型高 ~0.004。下一步应**软化锚点**以释放位置精度。
 
-### 5.2.4 下一步（待执行）：软化空间锚点，消除网格偏置
+### 5.2.4 软化空间锚点（已选定并运行中）：warmup 后冻结+退火释放
 
-> 目标：保留"打破坍缩"的能力，但允许对象学到任意连续位置，把 oracle_bbox 从 +8.3% 压回 ~0、mae 推到原基线 0.0733 以下。
+> 目标：保留"打破坍缩"能力，但允许对象学到任意连续位置，把 oracle_bbox 从 +8.3% 压回 ~0、mae 推到原基线 0.0733 以下。
+> **已决策（用户授权"你选吧"）：采用 方案②+③ 组合** —— 冻结 `spatial_anchor` 使其不被训练放回到网格，并按 step 把 `anchor_scale` 从 1.0 退火到 0.0，释放后由 `w_div` 正则 + matched 几何损失维持对象分散、学到真实连续位置。
 
-候选方案（按性价比排序）：
-1. **缩小锚点尺度**：`spatial_anchor` 初始化 std 从全幅（logit 映射 0.125~0.875）降到 ~0.3×，或 forward 中 `cx_logit = anchor*0.3 + delta`，让 delta 主导精细位置。
-2. **锚点仅作 warmup 先验**：前 N 步保留锚点打破对称，之后 `anchor_scale` 余弦退火到 0，交给 matched 几何损失自由学位置。
-3. **改用软空间多样性正则**：去掉 hard 位置偏移，保留 `spatial_diversity` 正则（`w_div`）防止回退到中心坍缩，避免网格锁定。
-4. 上述任一 + 继续训练 ~10–20k 步（sub_px=1+no-ckpt ≈ 2.7–3.1 it/s，约 60–90min）。
+**代码改动（已提交）：**
+- `model/network.py`：`forward(img, anchor_scale=1.0)`，`slots[...,I_BBOX:I_BBOX+2] += spatial_anchor * anchor_scale`（缩放而非硬加）。
+- `train.py`：新增 `--anchor-scale`（floor）、`--anchor-anneal-start/end`、`--freeze-anchor`；`anchor_scale_at(step)` 线性调度；日志加 `asc=` 监控。
 
-验证：重跑 `diag_query`/`diag_arch`，看 (a) 中心方差仍 >0.01（坍缩未回退）、(b) oracle_bbox 增益回落到 ~1–2%、(c) mae < 0.0733。
+**运行（2026-09-09）：**
+- 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 32000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --anchor-scale 0.0 --anchor-anneal-start 20000 --anchor-anneal-end 28000 --freeze-anchor --out runs/fix_anchor`
+- 状态：**运行中**（task hqBwtH，约 65min）；退火窗口 20k→28k，之后 asc=0 释放 4k 步。
+- 50 步冒烟已验证：`asc` 1.00→0.00 平滑、无 NaN/爆炸、gn 正常；asc=0 后 50 步未塌缩（w_div 兜底）。
+
+**验证（待训练完）：** 重跑 `diag_query`/`diag_arch`，看 (a) 中心方差仍 >0.01（坍缩未回退）、(b) oracle_bbox 增益回落到 ~1–2%、(c) mae < 0.0733。若中心方差回退到 ~0 则改为 floor=0.2 重跑（保留弱先验防塌缩）。
 
 ## 6. 关键文件索引
 ```

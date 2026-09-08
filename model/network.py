@@ -112,7 +112,7 @@ class VectorNet(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         assert 3_000_000 <= n_params <= 8_000_000, f"param budget violated: {n_params}"
 
-    def forward(self, img):
+    def forward(self, img, anchor_scale: float = 1.0):
         feats = self.encoder(img)
         b = feats.shape[0]
         pos = self.pos_emb
@@ -125,7 +125,10 @@ class VectorNet(nn.Module):
             q = layer(q, tokens)
         h = self.final_norm(q)
         slots = self.slot_head(h)
-        slots[..., I_BBOX:I_BBOX + 2] = slots[..., I_BBOX:I_BBOX + 2] + self.spatial_anchor
+        # 空间锚点先验按 anchor_scale 缩放：训练早期=1.0 打破对称坍缩，
+        # 后期退火到 0 让对象学到任意连续位置（消除网格偏置）。
+        slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
+                                         + self.spatial_anchor * anchor_scale)
         aux = {"cls": self.cls_head(h), "ftype": self.ftype_head(h)}
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg

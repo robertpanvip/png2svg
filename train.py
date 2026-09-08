@@ -34,6 +34,14 @@ def parse_args():
     p.add_argument("--w-geom", type=float, default=0.7)
     p.add_argument("--w-bg", type=float, default=0.2)
     p.add_argument("--w-div", type=float, default=0.05)
+    p.add_argument("--anchor-scale", type=float, default=1.0,
+                   help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
+    p.add_argument("--anchor-anneal-start", type=int, default=99999999,
+                   help="step >= 此值开始把 anchor_scale 从 1.0 线性降到 --anchor-scale")
+    p.add_argument("--anchor-anneal-end", type=int, default=99999999,
+                   help="step >= 此值后 anchor_scale 固定为 --anchor-scale")
+    p.add_argument("--freeze-anchor", action="store_true",
+                   help="冻结 spatial_anchor（不再更新），仅作固定弱先验")
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=20)
@@ -54,11 +62,21 @@ def lr_at(step: int, args) -> float:
     return args.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
 
 
-def train_step(net, ren, gen, args, device):
+def anchor_scale_at(step: int, args) -> float:
+    """spatial_anchor 缩放调度：早期 1.0 打破对称，[start,end] 线性降到 floor。"""
+    if step <= args.anchor_anneal_start:
+        return 1.0
+    if step >= args.anchor_anneal_end:
+        return args.anchor_scale
+    frac = (step - args.anchor_anneal_start) / max(1, args.anchor_anneal_end - args.anchor_anneal_start)
+    return 1.0 + (args.anchor_scale - 1.0) * frac
+
+
+def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
     scene = gen.sample()
     img_gt = ren.render_scene(scene).detach()
     slots_gt, bg_gt = encode_scene(scene)
-    slots, aux, bg = net(img_gt.unsqueeze(0).to(device))
+    slots, aux, bg = net(img_gt.unsqueeze(0).to(device), anchor_scale=anchor_scale)
     slots = slots[0]
     bg_raw = bg[0]
     cls_ids = aux["cls"][0].detach().argmax(-1).cpu().numpy()
@@ -117,6 +135,10 @@ def main():
         gen._rng.bit_generator.state = ck["gen_rng"]
         print(f"[resume] {args.resume} @ step {start_step}")
 
+    if args.freeze_anchor:
+        net.spatial_anchor.requires_grad_(False)
+        print("[train] spatial_anchor frozen (fixed weak prior)")
+
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
             "geom", "bg", "div", "aux", "total"]
@@ -129,7 +151,8 @@ def main():
             g["lr"] = lr_at(step, args)
 
         opt.zero_grad(set_to_none=True)
-        total, parts = train_step(net, ren, gen, args, args.device)
+        a_scale = anchor_scale_at(step, args)
+        total, parts = train_step(net, ren, gen, args, args.device, a_scale)
         gn = torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
         opt.step()
 
@@ -147,7 +170,7 @@ def main():
                 f.write(json.dumps(rec) + "\n")
             print(f"[{step + 1}/{args.steps}] total={m['total']:.4f} "
                   f"render={m['render']:.4f} mae={m['mae']:.4f} "
-                  f"geom={m['geom']:.4f} gn={float(gn):.2f} "
+                  f"geom={m['geom']:.4f} asc={a_scale:.2f} gn={float(gn):.2f} "
                   f"({sps:.2f} it/s)", flush=True)
             avg = {k: 0.0 for k in keys}
             n_log = 0
