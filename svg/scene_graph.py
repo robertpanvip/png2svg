@@ -19,9 +19,13 @@ CMD_M = "M"
 CMD_L = "L"
 CMD_Q = "Q"
 CMD_C = "C"
+CMD_A = "A"
 CMD_Z = "Z"
 
-_CMD_POINTS = {CMD_M: 1, CMD_L: 1, CMD_Q: 2, CMD_C: 3, CMD_Z: 0}
+# Total coordinate count per command (flat list in Segment.pts).
+#   M=[sx,sy]  L=[ex,ey]  Q=[cx,cy,ex,ey]  C=[c1x,c1y,c2x,c2y,ex,ey]
+#   A=[rx,ry,rot,largearc,sweep,ex,ey]  Z=[]
+_CMD_POINTS = {CMD_M: 2, CMD_L: 2, CMD_Q: 4, CMD_C: 6, CMD_A: 7, CMD_Z: 0}
 
 
 def clamp01(x: float) -> float:
@@ -49,8 +53,8 @@ class Segment:
 
     def __post_init__(self):
         n = _CMD_POINTS[self.cmd]
-        if len(self.pts) != n * 2:
-            raise ValueError(f"cmd {self.cmd} expects {n * 2} coords, got {len(self.pts)}")
+        if len(self.pts) != n:
+            raise ValueError(f"cmd {self.cmd} expects {n} coords, got {len(self.pts)}")
 
 
 @dataclass
@@ -110,6 +114,9 @@ class Stroke:
     width: float
     color: tuple
     alpha: float = 1.0
+    dash: tuple = ()          # 虚线数组（用户单位，uv 归一化），空=实线
+    linecap: str = "butt"     # butt / round / square
+    linejoin: str = "miter"   # miter / round / bevel
 
 
 @dataclass
@@ -126,6 +133,18 @@ class Effects:
 
 
 @dataclass
+class Clip:
+    ref: int = -1                      # 引用另一 object 索引作为裁切路径（-1=未用）
+    path: Optional["PathGeom"] = None  # 或内联裁切路径
+
+
+@dataclass
+class Mask:
+    ref: int = -1                      # 引用另一 object 索引作为亮度遮罩
+    kind: str = "luminance"            # luminance / alpha
+
+
+@dataclass
 class ShapeObject:
     shape: str
     geometry: object
@@ -133,6 +152,9 @@ class ShapeObject:
     stroke: Optional[Stroke] = None
     opacity: float = 1.0
     effects: Optional[Effects] = None
+    group: int = 0                     # 组合分组 id（0=无分组）
+    clip: Optional[Clip] = None        # 裁切
+    mask: Optional[Mask] = None        # 遮罩
 
 
 @dataclass
@@ -207,6 +229,16 @@ def _object_to_dict(o: ShapeObject) -> dict:
         },
         "opacity": o.opacity,
         "effects": None if o.effects is None else vars(o.effects).copy(),
+        "group": o.group,
+        "clip": None if o.clip is None else {
+            "ref": o.clip.ref,
+            "path": None if o.clip.path is None else {
+                "bbox": _bbox_to_dict(o.clip.path.bbox),
+                "segments": [{"cmd": s.cmd, "pts": list(s.pts)} for s in o.clip.path.segments],
+                "closed": o.clip.path.closed,
+            },
+        },
+        "mask": None if o.mask is None else {"ref": o.mask.ref, "kind": o.mask.kind},
     }
 
 
@@ -264,12 +296,29 @@ def _object_from_dict(d: dict) -> ShapeObject:
         ),
     )
     sd = d.get("stroke")
-    stroke = None if sd is None else Stroke(float(sd["width"]), tuple(sd["color"]), float(sd["alpha"]))
+    stroke = None if sd is None else Stroke(
+        float(sd["width"]), tuple(sd["color"]), float(sd.get("alpha", 1.0)),
+        dash=tuple(sd.get("dash", ()) or ()),
+        linecap=str(sd.get("linecap", "butt")),
+        linejoin=str(sd.get("linejoin", "miter")),
+    )
     ed = d.get("effects")
     effects = None if ed is None else Effects(**ed)
+    cd = d.get("clip")
+    clip = None if cd is None else Clip(
+        ref=int(cd.get("ref", -1)),
+        path=None if cd.get("path") is None else PathGeom(
+            bbox=BBox(**cd["path"]["bbox"]),
+            segments=[Segment(s["cmd"], list(s["pts"])) for s in cd["path"]["segments"]],
+            closed=bool(cd["path"].get("closed", True)),
+        ),
+    )
+    mdd = d.get("mask")
+    mask = None if mdd is None else Mask(ref=int(mdd.get("ref", -1)), kind=str(mdd.get("kind", "luminance")))
     return ShapeObject(
         shape=d["shape"], geometry=geom, fill=fill, stroke=stroke,
         opacity=float(d.get("opacity", 1.0)), effects=effects,
+        group=int(d.get("group", 0)), clip=clip, mask=mask,
     )
 
 
@@ -308,5 +357,18 @@ def _validate_object(obj: ShapeObject, i: int):
             if not (prev - 1e-9 <= s.position <= 1.0 + 1e-9):
                 raise ValueError(f"object {i}: stop positions must be non-decreasing")
             prev = s.position
-    if obj.stroke is not None and not (0.0 < obj.stroke.width <= 0.25):
-        raise ValueError(f"object {i}: stroke width out of range")
+    if obj.stroke is not None:
+        if not (0.0 < obj.stroke.width <= 0.25):
+            raise ValueError(f"object {i}: stroke width out of range")
+        if obj.stroke.linecap not in ("butt", "round", "square"):
+            raise ValueError(f"object {i}: bad linecap {obj.stroke.linecap!r}")
+        if obj.stroke.linejoin not in ("miter", "round", "bevel"):
+            raise ValueError(f"object {i}: bad linejoin {obj.stroke.linejoin!r}")
+        if any(not (0.0 <= d <= 1.0) for d in obj.stroke.dash):
+            raise ValueError(f"object {i}: dash value out of range")
+    if obj.clip is not None:
+        # clip.ref 引用另一 object 下标，由 generator/encoder 侧保证合法，此处仅做符号校验
+        if obj.clip.ref < -1:
+            raise ValueError(f"object {i}: bad clip ref {obj.clip.ref}")
+    if obj.mask is not None and obj.mask.kind not in ("luminance", "alpha"):
+        raise ValueError(f"object {i}: bad mask kind {obj.mask.kind!r}")

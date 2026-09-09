@@ -6,14 +6,15 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from svg.scene_graph import (
-    Scene, ShapeObject, BBox, Segment, PathGeom, PolygonGeom, EllipseGeom, RectGeom,
-    Stop, Gradient, Fill, Stroke,
+    Scene, ShapeObject, BBox, Segment, PathGeom, Stop, Gradient, Fill, Stroke,
+    Effects, Clip, Mask,
     FILL_NONE, FILL_SOLID, FILL_LINEAR, FILL_RADIAL,
-    SHAPE_PATH, SHAPE_ELLIPSE, SHAPE_RECT, SHAPE_POLYGON,
-    CMD_M, CMD_C, CMD_L, CMD_Z,
+    SHAPE_PATH,
+    CMD_M, CMD_L, CMD_Q, CMD_C, CMD_A, CMD_Z,
 )
 
-_SHAPES = ("blob", "polygon", "ellipse", "rect", "stroke")
+# 路径子类型分布（取代旧 5 粗类；blob 不再是"类"，而是 cubic 闭合路径）
+_PATH_KINDS = ("line", "poly", "quad", "cubic", "arc", "compound")
 
 
 @dataclass
@@ -26,14 +27,23 @@ class GeneratorConfig:
     max_bbox: float = 0.55
     overlap_prob: float = 0.7
     alpha_prob: float = 0.35
-    stroke_prob: float = 0.25
+    stroke_prob: float = 0.35
     gradient_prob: float = 0.5
-    hole_prob: float = 0.15
+    hole_prob: float = 0.18
     transparent_bg_prob: float = 0.3
-    max_stops: int = 4
-    shape_weights: dict = field(default_factory=lambda: {
-        "blob": 0.35, "polygon": 0.20, "ellipse": 0.15, "rect": 0.15, "stroke": 0.15,
+    max_stops: int = 6
+    # 路径子类型权重（P1 几何）
+    path_weights: dict = field(default_factory=lambda: {
+        "line": 0.15, "poly": 0.15, "quad": 0.15, "cubic": 0.25, "arc": 0.15, "compound": 0.15,
     })
+    # P3 stroke 样式
+    stroke_attr_prob: float = 0.5
+    # P4 effects
+    effects_prob: float = 0.35
+    # P5 composition
+    group_prob: float = 0.3
+    clip_prob: float = 0.18
+    mask_prob: float = 0.15
 
 
 def _hsv_to_rgb(h, s, v):
@@ -41,7 +51,8 @@ def _hsv_to_rgb(h, s, v):
     return (r, g, b)
 
 
-def _catmull_rom_to_bezier(points: np.ndarray) -> list:
+def _catmull_rom_closed(points: np.ndarray) -> list:
+    """闭合 Catmull-Rom → cubic 段序列（uv 局部坐标）。"""
     n = len(points)
     segs = [Segment(CMD_M, [float(points[0, 0]), float(points[0, 1])])]
     for i in range(n):
@@ -54,6 +65,22 @@ def _catmull_rom_to_bezier(points: np.ndarray) -> list:
         segs.append(Segment(CMD_C, [float(c1[0]), float(c1[1]), float(c2[0]), float(c2[1]),
                                     float(p2[0]), float(p2[1])]))
     segs.append(Segment(CMD_Z, []))
+    return segs
+
+
+def _catmull_rom_open(points: np.ndarray) -> list:
+    """开放 Catmull-Rom → cubic 段序列（uv 局部坐标）。"""
+    n = len(points)
+    segs = [Segment(CMD_M, [float(points[0, 0]), float(points[0, 1])])]
+    for i in range(n - 1):
+        p0 = points[max(i - 1, 0)]
+        p1 = points[i]
+        p2 = points[i + 1]
+        p3 = points[min(i + 2, n - 1)]
+        c1 = p1 + (p2 - p0) / 6.0
+        c2 = p2 - (p3 - p1) / 6.0
+        segs.append(Segment(CMD_C, [float(c1[0]), float(c1[1]), float(c2[0]), float(c2[1]),
+                                    float(p2[0]), float(p2[1])]))
     return segs
 
 
@@ -75,6 +102,10 @@ def _radial_points(rng, k: int) -> np.ndarray:
 
 def _scaled(points: np.ndarray, factor: float) -> np.ndarray:
     return 0.5 + (points - 0.5) * factor
+
+
+def _rand_uv(rng, k: int, pad: float = 0.12) -> np.ndarray:
+    return rng.uniform(pad, 1.0 - pad, size=(k, 2))
 
 
 def _sample_shape_bbox(rng, cfg: GeneratorConfig, placed: list) -> BBox:
@@ -143,85 +174,122 @@ def _sample_gradient(rng, cfg: GeneratorConfig, bbox: BBox) -> Gradient:
 
 def _sample_fill(rng, cfg: GeneratorConfig, bbox: BBox) -> Fill:
     if rng.random() < cfg.gradient_prob:
-        return _gradient_fill(rng, cfg, bbox)
+        g = _sample_gradient(rng, cfg, bbox)
+        return Fill(type=g.kind, color=(0.0, 0.0, 0.0), alpha=1.0, gradient=g)
     alpha = float(rng.uniform(0.35, 1.0)) if rng.random() < cfg.alpha_prob else 1.0
     return Fill(type=FILL_SOLID, color=_sample_color(rng), alpha=alpha)
 
 
-def _gradient_fill(rng, cfg: GeneratorConfig, bbox: BBox) -> Fill:
-    g = _sample_gradient(rng, cfg, bbox)
-    return Fill(type=g.kind, color=(0.0, 0.0, 0.0), alpha=1.0, gradient=g)
+# ---- 路径几何工厂（段坐标均为 uv 局部帧 [0,1]，由 bbox 映射）----
 
 
-def _make_blob(rng, cfg: GeneratorConfig, bbox: BBox, hole: bool):
-    k = int(rng.integers(6, 11))
-    pts = _radial_points(rng, k)
-    segs = _catmull_rom_to_bezier(pts)
-    if hole:
-        inner = _catmull_rom_to_bezier(_scaled(pts, rng.uniform(0.35, 0.55)))
-        segs.extend(inner)
-    geom = PathGeom(bbox=bbox, segments=segs, closed=True)
-    return ShapeObject(shape=SHAPE_PATH, geometry=geom)
+def _make_line_path(rng, bbox: BBox, closed: bool):
+    k = int(rng.integers(3, 7))
+    pts = _rand_uv(rng, k)
+    segs = [Segment(CMD_M, [float(pts[0, 0]), float(pts[0, 1])])]
+    for i in range(1, k):
+        segs.append(Segment(CMD_L, [float(pts[i, 0]), float(pts[i, 1])]))
+    if closed:
+        segs.append(Segment(CMD_Z, []))
+    return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=segs, closed=closed))
 
 
-def _make_polygon(rng, cfg: GeneratorConfig, bbox: BBox):
-    k = int(rng.integers(5, 9))
-    pts = _radial_points(rng, k)
-    poly = PolygonGeom(bbox=bbox, points=[(float(u), float(v)) for u, v in pts])
-    return ShapeObject(shape=SHAPE_POLYGON, geometry=poly)
+def _make_quad_path(rng, bbox: BBox, closed: bool):
+    k = int(rng.integers(3, 6))
+    pts = _radial_points(rng, k) if closed else _rand_uv(rng, k)
+    segs = [Segment(CMD_M, [float(pts[0, 0]), float(pts[0, 1])])]
+    for i in range(1, k):
+        p0 = pts[i - 1]
+        p1 = pts[i]
+        mid = (p0 + p1) / 2.0
+        ctrl = mid + rng.uniform(-0.18, 0.18, size=2)
+        segs.append(Segment(CMD_Q, [float(ctrl[0]), float(ctrl[1]),
+                                    float(p1[0]), float(p1[1])]))
+    if closed:
+        segs.append(Segment(CMD_Z, []))
+    return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=segs, closed=closed))
 
 
-def _make_ellipse(rng, cfg: GeneratorConfig, bbox: BBox):
-    return ShapeObject(shape=SHAPE_ELLIPSE, geometry=EllipseGeom(bbox=bbox))
+def _make_cubic_path(rng, bbox: BBox, closed: bool):
+    k = int(rng.integers(5, 10))
+    pts = _radial_points(rng, k) if closed else _rand_uv(rng, k, pad=0.1)
+    segs = _catmull_rom_closed(pts) if closed else _catmull_rom_open(pts)
+    return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=segs, closed=closed))
 
 
-def _make_rect(rng, cfg: GeneratorConfig, bbox: BBox):
-    if rng.random() < 0.5:
-        theta = rng.uniform(0.0, np.pi)
-        ca, sa = np.cos(theta) * 0.5, np.sin(theta) * 0.5
-        corners = np.array([
-            [-ca - sa, -sa + ca],
-            [ca - sa, sa + ca],
-            [ca + sa, sa - ca],
-            [-ca + sa, -sa - ca],
-        ])
-        pts = np.stack([0.5 + corners[:, 0], 0.5 + corners[:, 1]], axis=1)
-        poly = PolygonGeom(bbox=bbox, points=[(float(u), float(v)) for u, v in pts])
-        return ShapeObject(shape=SHAPE_POLYGON, geometry=poly)
-    return ShapeObject(shape=SHAPE_RECT, geometry=RectGeom(bbox=bbox))
+def _make_arc_path(rng, bbox: BBox, closed: bool):
+    r = float(rng.uniform(0.30, 0.46))
+    if closed:
+        # 完整椭圆：4 段 90° 弧
+        angs = np.linspace(0.0, 2.0 * np.pi, 5)
+        ring = np.stack([0.5 + r * np.cos(angs), 0.5 + r * np.sin(angs)], axis=1)
+        segs = [Segment(CMD_M, [float(ring[0, 0]), float(ring[0, 1])])]
+        for i in range(1, 4):
+            segs.append(Segment(CMD_A, [r, r, 0.0, 0.0, 1.0,
+                                        float(ring[i, 0]), float(ring[i, 1])]))
+        segs.append(Segment(CMD_A, [r, r, 0.0, 0.0, 1.0,
+                                    float(ring[4, 0]), float(ring[4, 1])]))
+        segs.append(Segment(CMD_Z, []))
+        return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=segs, closed=True))
+    # 开放弧
+    a0 = rng.uniform(0.0, 2.0 * np.pi)
+    span = float(rng.uniform(np.pi / 3, 5.0 * np.pi / 3))
+    a1 = a0 + span
+    p0 = (0.5 + r * np.cos(a0), 0.5 + r * np.sin(a0))
+    p1 = (0.5 + r * np.cos(a1), 0.5 + r * np.sin(a1))
+    large = 1.0 if span > np.pi else 0.0
+    segs = [Segment(CMD_M, [float(p0[0]), float(p0[1])]),
+            Segment(CMD_A, [r, r, 0.0, large, 1.0, float(p1[0]), float(p1[1])])]
+    return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=segs, closed=False))
 
 
-def _make_stroke_path(rng, cfg: GeneratorConfig, bbox: BBox):
-    n = int(rng.integers(4, 9))
-    kind = rng.random()
-    if kind < 0.5:
-        t = np.linspace(0.0, 1.0, n)
-        amp = rng.uniform(0.25, 0.45)
-        phase = rng.uniform(0.0, 2.0 * np.pi)
-        freq = rng.uniform(1.0, 2.5) * np.pi
-        u = t
-        v = 0.5 + amp * np.sin(freq * t + phase) * (1.0 if rng.random() < 0.5 else t * 0.5 + 0.5)
-        pts = np.stack([u, v], axis=1)
-        segs = [Segment(CMD_M, [float(pts[0, 0]), float(pts[0, 1])])]
-        for i in range(1, n):
-            segs.append(Segment(CMD_L, [float(pts[i, 0]), float(pts[i, 1])]))
-    else:
-        turns = rng.uniform(1.0, 2.2) * 2.0 * np.pi
-        t = np.linspace(0.0, 1.0, n)
-        r = np.linspace(0.15, 0.5, n)
-        ang = turns * t + rng.uniform(0.0, 2.0 * np.pi)
-        pts = np.stack([0.5 + r * np.cos(ang), 0.5 + r * np.sin(ang)], axis=1)
-        segs = [Segment(CMD_M, [float(pts[0, 0]), float(pts[0, 1])])]
-        for i in range(1, n):
-            segs.append(Segment(CMD_L, [float(pts[i, 0]), float(pts[i, 1])]))
-    geom = PathGeom(bbox=bbox, segments=segs, closed=False)
+def _make_compound_path(rng, bbox: BBox):
+    # 外环（cubic 闭合）+ 内孔（反向 winding 的小椭圆），构成带孔闭合路径
+    k = int(rng.integers(6, 9))
+    outer = _catmull_rom_closed(_radial_points(rng, k))
+    r = float(rng.uniform(0.18, 0.30))
+    angs = np.linspace(0.0, 2.0 * np.pi, 5)
+    ring = np.stack([0.5 + r * np.cos(angs), 0.5 + r * np.sin(angs)], axis=1)
+    inner = [Segment(CMD_M, [float(ring[0, 0]), float(ring[0, 1])])]
+    for i in range(1, 4):
+        inner.append(Segment(CMD_A, [r, r, 0.0, 0.0, 0.0,
+                                     float(ring[i, 0]), float(ring[i, 1])]))
+    inner.append(Segment(CMD_A, [r, r, 0.0, 0.0, 0.0,
+                                 float(ring[4, 0]), float(ring[4, 1])]))
+    inner.append(Segment(CMD_Z, []))
+    return ShapeObject(shape=SHAPE_PATH, geometry=PathGeom(bbox=bbox, segments=outer + inner, closed=True))
+
+
+def _make_stroke(rng, cfg: GeneratorConfig):
+    width = float(rng.uniform(0.008, 0.05))
     color = _sample_color(rng)
-    return ShapeObject(
-        shape=SHAPE_PATH, geometry=geom,
-        fill=Fill(type=FILL_NONE),
-        stroke=Stroke(width=float(rng.uniform(0.015, 0.05)), color=color,
-                      alpha=float(rng.uniform(0.5, 1.0)) if rng.random() < 0.3 else 1.0),
-    )
+    alpha = float(rng.uniform(0.5, 1.0)) if rng.random() < 0.3 else 1.0
+    if rng.random() < cfg.stroke_attr_prob:
+        nd = int(rng.integers(1, 4))
+        dash = tuple(float(x) for x in rng.uniform(0.02, 0.12, size=nd))
+        linecap = rng.choice(["butt", "round", "square"])
+        linejoin = rng.choice(["miter", "round", "bevel"])
+    else:
+        dash, linecap, linejoin = (), "butt", "miter"
+    return Stroke(width=width, color=color, alpha=alpha, dash=dash,
+                  linecap=linecap, linejoin=linejoin)
+
+
+def _sample_effects(rng, cfg: GeneratorConfig):
+    if rng.random() >= cfg.effects_prob:
+        return None
+    kind = rng.choice(["blur", "shadow", "glow"])
+    if kind == "blur":
+        return Effects(blur_radius=float(rng.uniform(0.02, 0.08)))
+    if kind == "shadow":
+        return Effects(shadow_dx=float(rng.uniform(-0.06, 0.06)),
+                       shadow_dy=float(rng.uniform(-0.06, 0.06)),
+                       shadow_blur=float(rng.uniform(0.02, 0.08)),
+                       shadow_rgb=_sample_color(rng),
+                       shadow_alpha=float(rng.uniform(0.3, 0.8)))
+    return Effects(glow_radius=float(rng.uniform(0.03, 0.12)),
+                   glow_rgb=(1.0, 1.0, 1.0),
+                   glow_alpha=float(rng.uniform(0.3, 0.8)))
 
 
 class SceneGenerator:
@@ -234,44 +302,43 @@ class SceneGenerator:
         rng = self._rng
         cfg = self.cfg
         n_objects = int(rng.integers(cfg.min_objects, cfg.max_objects + 1))
-        weights = np.array([cfg.shape_weights.get(s, 0.0) for s in _SHAPES], dtype=np.float64)
+        weights = np.array([cfg.path_weights.get(s, 0.0) for s in _PATH_KINDS], dtype=np.float64)
         weights = weights / weights.sum()
         placed: list = []
         objects: list = []
         for _ in range(n_objects):
-            shape = _SHAPES[int(rng.choice(len(_SHAPES), p=weights))]
+            kind = _PATH_KINDS[int(rng.choice(len(_PATH_KINDS), p=weights))]
             bbox = _sample_shape_bbox(rng, cfg, placed)
             placed.append(bbox)
-            if shape == "blob":
-                hole = rng.random() < cfg.hole_prob
-                obj = _make_blob(rng, cfg, bbox, hole)
-                obj.fill = _sample_fill(rng, cfg, bbox)
-                if rng.random() < cfg.stroke_prob and not hole:
-                    obj.stroke = Stroke(width=float(rng.uniform(0.008, 0.03)),
-                                        color=_sample_color(rng), alpha=1.0)
-            elif shape == "polygon":
-                obj = _make_polygon(rng, cfg, bbox)
-                obj.fill = _sample_fill(rng, cfg, bbox)
-                if rng.random() < cfg.stroke_prob:
-                    obj.stroke = Stroke(width=float(rng.uniform(0.008, 0.03)),
-                                        color=_sample_color(rng), alpha=1.0)
-            elif shape == "ellipse":
-                obj = _make_ellipse(rng, cfg, bbox)
-                obj.fill = _sample_fill(rng, cfg, bbox)
-                if rng.random() < cfg.stroke_prob:
-                    obj.stroke = Stroke(width=float(rng.uniform(0.008, 0.03)),
-                                        color=_sample_color(rng), alpha=1.0)
-            elif shape == "rect":
-                obj = _make_rect(rng, cfg, bbox)
-                obj.fill = _sample_fill(rng, cfg, bbox)
-                if rng.random() < cfg.stroke_prob:
-                    obj.stroke = Stroke(width=float(rng.uniform(0.008, 0.03)),
-                                        color=_sample_color(rng), alpha=1.0)
+            if kind == "line":
+                obj = _make_line_path(rng, bbox, closed=False)
+            elif kind == "poly":
+                obj = _make_line_path(rng, bbox, closed=True)
+            elif kind == "quad":
+                obj = _make_quad_path(rng, bbox, closed=rng.random() < 0.6)
+            elif kind == "cubic":
+                obj = _make_cubic_path(rng, bbox, closed=rng.random() < 0.7)
+            elif kind == "arc":
+                obj = _make_arc_path(rng, bbox, closed=rng.random() < 0.5)
             else:
-                obj = _make_stroke_path(rng, cfg, bbox)
-            if obj.fill.type != FILL_NONE and obj.fill.type != FILL_SOLID and rng.random() < cfg.alpha_prob:
+                obj = _make_compound_path(rng, bbox)
+            obj.fill = _sample_fill(rng, cfg, bbox)
+            if rng.random() < cfg.stroke_prob:
+                obj.stroke = _make_stroke(rng, cfg)
+            if obj.fill.type != FILL_NONE and rng.random() < cfg.alpha_prob:
                 obj.opacity = float(rng.uniform(0.55, 1.0))
+            obj.effects = _sample_effects(rng, cfg)
             objects.append(obj)
+
+        # P5 composition：分组 / 裁切 / 遮罩（引用更早 object 下标）
+        for i, obj in enumerate(objects):
+            if i > 0 and rng.random() < cfg.group_prob:
+                obj.group = int(rng.integers(1, 4))
+            if i > 0 and rng.random() < cfg.clip_prob:
+                obj.clip = Clip(ref=int(rng.integers(0, i)))
+            if i > 0 and rng.random() < cfg.mask_prob:
+                obj.mask = Mask(ref=int(rng.integers(0, i)), kind=rng.choice(["luminance", "alpha"]))
+
         if rng.random() < cfg.transparent_bg_prob:
             background = None
         else:

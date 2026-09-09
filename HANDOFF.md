@@ -503,4 +503,90 @@ benchmarks/infer.py         最小推理 demo（默认 prune）
 train.py            训练入口（--device cuda 即 GPU 训练）
 evaluate.py         评估入口（CPU 全链路 + 耗时）
 HANDOFF.md          本文件
+
+## 11. 表示扩展路线图：Raster Graphics → Structured Vector Graphics（2026-09-09 战略转向）
+
+> **战略定位**：项目真正目标 = 把**结构化 PNG**（图标 / Logo / UI asset / 插画）转成**可编辑 SVG**，即 *Raster Graphics → Structured Vector Graphics*，而非任意照片光栅化。表示能力应从当前 5 粗类（`rect/ellipse/polygon/blob/stroke`）逐步收敛/扩张到贴近真实 SVG 的语义树：
+> ```
+> path   ├─ line / quadratic / cubic / arc / compound path
+> fill   ├─ solid / linearGradient / radialGradient
+> stroke ├─ width / dash / linecap / linejoin
+> effects├─ opacity / blur / shadow / glow
+> composition ├─ groups / clipping / masking / holes / z-order
+> ```
+> **这同时是消解 §5.2.7 blob 坍缩的根本手段**——见下。
+
+### 11.1 为什么这能从根上破坍缩
+
+- 当前 `targets.py` 把 `blob`（Catmull-Rom 贝塞尔环）编码成一个**万能近似类**，ellipse/rect/polygon/stroke 的轮廓它都能拟合 → 渲染损失对"选 blob"无惩罚 → 模型理性全选 blob（§5.2.7 已用数据坐实：240/240 全 blob，oracle_cls 仅 +1~2%）。
+- 把几何改成**显式路径段序列**（line/quad/cubic/arc + compound）后，**不再存在"万能类"**：椭圆就是椭圆弧、矩形就是 4 段 line+close、插画曲线就是一串 cubic。渲染是精确的，匹配在几何上有意义，坍缩吸引子消失。
+- 顺带让输出直接是**可编辑 SVG**（`<path d="M..L..Q..C..A..Z"/>`），对齐产品使命。
+
+### 11.2 现状盘点（backbone 比预期完善）
+
+`svg/scene_graph.py` 已支持：
+- `PathGeom` + `Segment`：命令 `M/L/Q/C/Z`（`CMD_Q` 已定义，但 `_CMD_POINTS` 缺 `A`）；✅ 路径段骨架在。
+- `Gradient`：`linear` / `radial` + `stops`；✅ 渐变在。
+- `Stroke`：`width/color/alpha`；❌ 缺 `dash/linecap/linejoin`。
+- `Effects`：`shadow_dx/dy/blur/rgb/alpha`、`glow_radius/rgb/alpha`、`blur_radius`；✅ 数据模型在，但 `spec.py`/`SoftSVGRenderer` **完全没渲染 effects**（被忽略）。
+- ❌ 无 `groups / clipping / masking`；`z-order` 靠 slot 顺序隐式表达。
+
+缺口 = ①消灭 blob 万能类、几何改路径段序列；②`generator.py` 扩展产出丰富语义；③`targets.py`/`network.py` 扩展表示；④`SoftSVGRenderer` 补齐 arc/quad/dash/effects/合成；⑤`losses.py`/matching 适配新几何。
+
+### 11.3 分阶段路线图（依用户 taxonomy 依赖顺序）
+
+| 阶段 | 内容 | 关键改动 | 与坍缩/产品关系 |
+|------|------|----------|----------------|
+| **P1 几何·path** | line/quad/cubic/arc + compound（去 blob） | `scene_graph` 加 `CMD_A`；几何张量改**路径段序列**（每 slot 变长段表：段类型 one-hot + 控制点）；`generator` 产真实曲线/弧/复合路径；`spec`/渲染器扁平化 quad+cubic+arc；`targets` 重编码 | **既是地基又是坍缩根因修复** |
+| **P2 fill** | solid / linear / radial（细化 stops） | 已基本具备；扩 `NUM_STOPS`、停点位置回归、多渐变 | 样式保真 |
+| **P3 stroke** | width / dash / linecap / linejoin | `Stroke` 加 `dash/linecap/linejoin`；渲染器描边样式（虚线、端点、连接） | 图标/UI 描边语义 |
+| **P4 effects** | opacity（已有）/ blur / shadow / glow | 渲染器实现可微 blur（可分卷积）/shadow（偏移+blur+合成）/glow（blur+加色）；`spec` 接 `Effects` | 插画/Logo 质感 |
+| **P5 composition** | groups / clipping / masking / holes / z-order | 新增 `Group`/`Clip`/`Mask` 结构 + 合成通道；`generator` 产嵌套/裁切/遮罩场景 | 复杂资产层级 |
+
+> 每阶段是**可独立训练验证**的增量；P1 优先（地基 + 破坍缩），P2/P3 可与 P1 同轮；P4/P5 工程量最大（可微滤波 + 合成通道），放后。
+
+### 11.4 关键架构决策（2026-09-09 已确认）
+
+- **几何表示 = path-segment 序列**（用户拍板，推荐方案）：每 slot 持有变长段表，段类型 one-hot{L,Q,C,A,Z} + 控制点；compound = 多 subpath 由 M/Z 划分。直接映射 SVG `d`，且**结构上消灭 blob 万能类**。
+- **起步范围 = 五阶段全上**（用户拍板）：P1 几何 → P2 fill → P3 stroke → P4 effects → P5 composition 全实现；训练用课程式逐步启用（先几何+fill+stroke，再 effects，再 composition）。
+- **对象容量**：维持 `NUM_SLOTS=8` + Hungarian 匹配（P5 groups 阶段再评估是否扩/变长）。
+- 与 in-flight `fix_soft`（§5.2.7.2，task K5n7X6）关系：soft-cls 验证"渲染对类可微能否破坍缩"；若 P1 去 blob 落地，类坍缩可能自然消解，fix_soft 结论转对照参考，不必继续长训。
+
+### 11.5 下一步（已启动，见 §11.6 + 任务 #20–#26）
+
+1. 锁新 slot 张量契约（§11.6）→ 改 `scene_graph`（`CMD_A`/Stroke 样式/Group/Clip/Mask）+ `generator`（全 taxonomy）+ `targets`/`network`（段序列编码）+ `spec`/渲染器（扁平化 + 样式 + effects + 合成）+ `losses`/matching（段级监督）。
+2. 课程式训练：先几何+fill+stroke 收敛，再启用 effects，再 composition；每阶段 4k 验证。
+3. 判定：预测出现非 blob 几何、oracle 类/几何增益、mae 不退步。
+
+### 11.6 新 slot 张量契约（数据侧 → 模型侧共同接口，任务 #20）
+
+> 每 slot 不再有 `CLS`(5 类万能近似)，而是**显式路径段序列 + 属性块**。坐标统一在 slot 局部 bbox 归一化帧（uv∈[0,1]，与现 `I_PTS` 约定一致）。`NUM_SLOTS=8`，`N_SEG=16`（变长段表；实测 generator 单对象最大 16 段=外环 cubic + 内孔 4 弧 + M/Z，故取 16 留余量；compound 由 M 命令起新 subpath）。
+
+**维度预算（SLOT_DIM = 280）：**
+```
+几何基      : valid(1) + bbox(cx,cy,w,h)(4) + nseg(1) + closed(1)        = 7
+段表(16×12) : 每段 = type one-hot{M,L,Q,C,A}(5) + 坐标(7, 见下)         = 192
+fill 块     : ftype one-hot{none,solid,lin,rad}(4) + rgb(3) + alpha(1)
+             + gp0(2) + gp1(2) + radius(1) + stops(4×5) + nstops(1)      = 33
+stroke 块   : svalid(1) + width(1) + rgb(3) + alpha(1)
+             + dash(4 值 + offset=5) + linecap onehot{butt,round,sq}(3)
+             + linejoin onehot{miter,round,bevel}(3)                      = 17
+effects 块  : opacity(1) + blur_radius(1)
+             + shadow_dx,dy,blur(3) + shadow_rgb(3) + shadow_alpha(1)
+             + glow_radius(1) + glow_rgb(3) + glow_alpha(1)              = 14
+composition 块: group_id onehot{G=4}(4) + has_clip(1) + clip_mode{path,mask}(2)
+             + clip_ref(1) + has_mask(1) + mask_ref(1) + z(1)            = 11
+合计 = 7+192+33+17+14+11 = 274  → SLOT_DIM=280（余量 6）
+```
+**段坐标布局（每段固定 7 个坐标槽，按类型填充，其余置 0）：**
+```
+M : [sx, sy, 0,0,0,0,0]
+L : [ex, ey, 0,0,0,0,0]
+Q : [cx, cy, ex, ey, 0,0,0]            (控制 + 终点)
+C : [c1x,c1y, c2x,c2y, ex,ey, 0]
+A : [rx, ry, rot, largearc, sweep, ex, ey]
+```
+**I_* 索引（待 #23 targets 实现时落定精确值）**：几何基 0–6；段表 7–198（16×12）；fill 199–231；stroke 232–248；effects 249–262；composition 263–273（SLOT_DIM=280）。
+
+**渲染器契约（`spec.py`→`SoftSVGRenderer`）**：`slots_to_objs` 改为按段表重建 `PathGeom`（typed M/L/Q/C/A + compound），`Stroke` 带 dash/cap/join，`Effects` 接通 blur/shadow/glow（可微），`Group/Clip/Mask` 走合成通道。封闭形状（closed=1 且无显式 Z 段）自动补 Z。
 ```
