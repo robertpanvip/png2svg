@@ -15,7 +15,7 @@ from model.targets import (
     _slot_template,
 )
 from svg.scene_graph import FILL_LINEAR, FILL_RADIAL
-from dataset.renderer import _ellipse_subpath
+from dataset.renderer import _ellipse_subpath, _tt
 
 C_MIN, C_MAX = -0.20, 1.20
 W_MIN, W_MAX = 0.02, 1.30
@@ -104,6 +104,78 @@ def _to_abs(uv: torch.Tensor, cx, cy, w, h) -> torch.Tensor:
                         cy + (uv[..., 1] - 0.5) * h], dim=-1)
 
 
+def _build_obj(slots_raw, f, k, cls, ftype, canvas, pad_px,
+               curve_samples: int = CURVE_SAMPLES):
+    """为单个 slot 构造指定类别的内部渲染 dict（与 slots_to_objs 等价）。
+
+    返回 {"geo","fill","stroke","opacity","crop"}，可直接喂给
+    SoftSVGRenderer._object_layer。所有量均对 slots_raw 可微，
+    供 soft class mixing 复用。
+    """
+    valid = f["valid"][k]
+    cx, cy, w, h = f["cx"][k], f["cy"][k], f["w"][k], f["h"][k]
+
+    hw = 0.5 * f["sw"][k]
+    stroke_spec = (hw, f["stroke_rgb"][k],
+                   f["stroke_alpha"][k] * f["stroke_valid"][k] * valid)
+
+    if cls == CLS_ELLIPSE:
+        uv = _ELLIPSE_UV.to(dtype=slots_raw.dtype, device=slots_raw.device)
+        geo = ("poly", [(_to_abs(uv, cx, cy, w, h), True)])
+    elif cls == CLS_RECT:
+        geo = ("rect", (cx, cy, w, h))
+    else:
+        ctrl_uv = _collapse_pts(f["pts"][k], f["n_soft"][k])
+        ctrl = _to_abs(ctrl_uv, cx, cy, w, h)
+        if cls == CLS_BLOB:
+            subs = [(_flatten_ring(ctrl, curve_samples), True)]
+            hole = f["hole"][k]
+            if float(hole.detach()) > HOLE_MIN:
+                inner_uv = 0.5 + (ctrl_uv - 0.5) * hole
+                inner = _to_abs(inner_uv, cx, cy, w, h)
+                subs.append((_flatten_ring(inner, curve_samples), True))
+            geo = ("poly", subs)
+        elif cls == CLS_POLYGON:
+            geo = ("poly", [(ctrl, True)])
+        else:  # CLS_STROKE
+            geo = ("poly", [(ctrl, False)])
+
+    fill_spec = None
+    if cls != CLS_STROKE and ftype != FILL_NONE_I:
+        gate = f["fill_alpha"][k] * valid
+        if ftype == FILL_SOLID_I:
+            fill_spec = ("solid", f["rgb"][k], gate)
+        else:
+            n_s = int(round(float(torch.sigmoid(slots_raw[k, I_NSTOPS].detach())) * 2.0 + 2.0))
+            n_s = max(2, min(NUM_STOPS, n_s))
+            st_used = f["stops"][k][:n_s]
+            pos, order = torch.sort(st_used[:, 0])
+            grad = {
+                "p0": f["gp0"][k], "p1": f["gp1"][k], "radius": f["radius"][k],
+                "pos": pos, "rgb": st_used[order, 1:4], "alpha": st_used[order, 4],
+            }
+            kind = FILL_LINEAR if ftype == FILL_LINEAR_I else FILL_RADIAL
+            fill_spec = (kind, grad, gate)
+
+    opacity = f["opacity"][k] * valid
+    hw_px = float(hw.detach()) * canvas
+    pad = (pad_px + hw_px) / canvas
+    if geo[0] == "rect":
+        fcx, fcy, fw, fh = (float(cx.detach()), float(cy.detach()),
+                            float(w.detach()), float(h.detach()))
+        gx0, gy0, gx1, gy1 = fcx - fw / 2, fcy - fh / 2, fcx + fw / 2, fcy + fh / 2
+    else:
+        allp = torch.cat([p for p, _ in geo[1]], dim=0).detach()
+        gx0, gy0 = float(allp[:, 0].min()), float(allp[:, 1].min())
+        gx1, gy1 = float(allp[:, 0].max()), float(allp[:, 1].max())
+    x0 = max(0, int(math.floor((gx0 - pad) * canvas)))
+    y0 = max(0, int(math.floor((gy0 - pad) * canvas)))
+    x1 = min(canvas, int(math.ceil((gx1 + pad) * canvas)))
+    y1 = min(canvas, int(math.ceil((gy1 + pad) * canvas)))
+    return {"geo": geo, "fill": fill_spec, "stroke": stroke_spec,
+            "opacity": opacity, "crop": (x0, y0, x1, y1)}
+
+
 def slots_to_objs(slots_raw: torch.Tensor, cls_ids, ftype_ids, bg_raw: torch.Tensor,
                   canvas: int, pad_px: float, curve_samples: int = CURVE_SAMPLES):
     f = squash_slots(slots_raw)
@@ -114,68 +186,67 @@ def slots_to_objs(slots_raw: torch.Tensor, cls_ids, ftype_ids, bg_raw: torch.Ten
             continue
         cls = int(cls_ids[k]) % NUM_CLS
         ftype = int(ftype_ids[k]) % 4
-        cx, cy, w, h = f["cx"][k], f["cy"][k], f["w"][k], f["h"][k]
-
-        hw = 0.5 * f["sw"][k]
-        stroke_spec = (hw, f["stroke_rgb"][k],
-                       f["stroke_alpha"][k] * f["stroke_valid"][k] * valid)
-
-        if cls == CLS_ELLIPSE:
-            uv = _ELLIPSE_UV.to(dtype=slots_raw.dtype, device=slots_raw.device)
-            geo = ("poly", [(_to_abs(uv, cx, cy, w, h), True)])
-        elif cls == CLS_RECT:
-            geo = ("rect", (cx, cy, w, h))
-        else:
-            ctrl_uv = _collapse_pts(f["pts"][k], f["n_soft"][k])
-            ctrl = _to_abs(ctrl_uv, cx, cy, w, h)
-            if cls == CLS_BLOB:
-                subs = [(_flatten_ring(ctrl, curve_samples), True)]
-                hole = f["hole"][k]
-                if float(hole.detach()) > HOLE_MIN:
-                    inner_uv = 0.5 + (ctrl_uv - 0.5) * hole
-                    inner = _to_abs(inner_uv, cx, cy, w, h)
-                    subs.append((_flatten_ring(inner, curve_samples), True))
-                geo = ("poly", subs)
-            elif cls == CLS_POLYGON:
-                geo = ("poly", [(ctrl, True)])
-            else:
-                geo = ("poly", [(ctrl, False)])
-
-        fill_spec = None
-        if cls != CLS_STROKE and ftype != FILL_NONE_I:
-            gate = f["fill_alpha"][k] * valid
-            if ftype == FILL_SOLID_I:
-                fill_spec = ("solid", f["rgb"][k], gate)
-            else:
-                n_s = int(round(float(torch.sigmoid(slots_raw[k, I_NSTOPS].detach())) * 2.0 + 2.0))
-                n_s = max(2, min(NUM_STOPS, n_s))
-                st_used = f["stops"][k][:n_s]
-                pos, order = torch.sort(st_used[:, 0])
-                grad = {
-                    "p0": f["gp0"][k], "p1": f["gp1"][k], "radius": f["radius"][k],
-                    "pos": pos, "rgb": st_used[order, 1:4], "alpha": st_used[order, 4],
-                }
-                kind = FILL_LINEAR if ftype == FILL_LINEAR_I else FILL_RADIAL
-                fill_spec = (kind, grad, gate)
-
-        opacity = f["opacity"][k] * valid
-        hw_px = float(hw.detach()) * canvas
-        pad = (pad_px + hw_px) / canvas
-        if geo[0] == "rect":
-            fcx, fcy, fw, fh = (float(cx.detach()), float(cy.detach()),
-                                float(w.detach()), float(h.detach()))
-            gx0, gy0, gx1, gy1 = fcx - fw / 2, fcy - fh / 2, fcx + fw / 2, fcy + fh / 2
-        else:
-            allp = torch.cat([p for p, _ in geo[1]], dim=0).detach()
-            gx0, gy0 = float(allp[:, 0].min()), float(allp[:, 1].min())
-            gx1, gy1 = float(allp[:, 0].max()), float(allp[:, 1].max())
-        x0 = max(0, int(math.floor((gx0 - pad) * canvas)))
-        y0 = max(0, int(math.floor((gy0 - pad) * canvas)))
-        x1 = min(canvas, int(math.ceil((gx1 + pad) * canvas)))
-        y1 = min(canvas, int(math.ceil((gy1 + pad) * canvas)))
-        objs.append({"geo": geo, "fill": fill_spec, "stroke": stroke_spec,
-                     "opacity": opacity, "crop": (x0, y0, x1, y1)})
+        obj = _build_obj(slots_raw, f, k, cls, ftype, canvas, pad_px, curve_samples)
+        objs.append(obj)
     return objs, squash_bg(bg_raw)
+
+
+def slots_to_objs_soft(slots_raw: torch.Tensor, ftype_ids, bg_raw: torch.Tensor,
+                       canvas: int, pad_px: float, curve_samples: int = CURVE_SAMPLES):
+    """soft class mixing 版：每个 slot 渲染全部 NUM_CLS 种形状变体，
+
+    返回 groups（每个 slot 一组候选 dict + 原始 cls_logits），
+    供 render_soft_objs 按 softmax(cls_logits) 混合。渲染梯度可反传到 cls 头。
+    """
+    f = squash_slots(slots_raw)
+    cls_logits = slots_raw[..., I_CLS:I_CLS + NUM_CLS]
+    groups = []
+    for k in range(NUM_SLOTS):
+        valid = f["valid"][k]
+        if float(valid.detach()) < VALID_SKIP:
+            continue
+        ftype = int(ftype_ids[k]) % 4
+        cands = []
+        for cls in range(NUM_CLS):
+            cands.append(_build_obj(slots_raw, f, k, cls, ftype, canvas, pad_px, curve_samples))
+        groups.append({"cands": cands, "cls_logits": cls_logits[k]})
+    return groups, squash_bg(bg_raw)
+
+
+def render_soft_objs(ren, groups, bg):
+    """按 softmax(cls_logits) 混合每个 slot 的 NUM_CLS 个形状层，再 alpha-over 合成。
+
+    层为 premultiplied，混合与合成均保持 premultiplied 约定，与 SoftSVGRenderer 一致。
+    """
+    S = ren.S
+    dev = ren.device
+    dt = ren.dtype
+    if bg is not None:
+        bg_t = _tt(bg, dt, dev)
+        canvas = torch.cat([bg_t[:3].reshape(3, 1, 1).expand(3, S, S),
+                            bg_t[3].reshape(1, 1, 1).expand(1, S, S)])
+    else:
+        canvas = torch.zeros(4, S, S, dtype=dt, device=dev)
+    for g in groups:
+        w = torch.softmax(g["cls_logits"], dim=-1)  # [NUM_CLS]
+        blended = torch.zeros(4, S, S, dtype=dt, device=dev)
+        for c, item in enumerate(g["cands"]):
+            x0, y0, x1, y1 = item["crop"]
+            if x1 <= x0 or y1 <= y0:
+                continue
+            if torch.is_grad_enabled():
+                # 梯度检查点：逐候选释放激活，避免 5× 形状层同时驻留显存
+                layer = torch.utils.checkpoint.checkpoint(
+                    ren._object_layer, item, use_reentrant=False)
+            else:
+                layer = ren._object_layer(item)
+            blended[:, y0:y1, x0:x1] += w[c] * layer
+        a = blended[3:4]
+        canvas = blended + canvas * (1.0 - a)
+    a_raw = canvas[3:4]
+    rgb_s = canvas[:3] / a_raw.clamp_min(1e-6)
+    rgb_s = torch.where(a_raw > 1e-6, rgb_s, torch.zeros_like(rgb_s))
+    return torch.cat([rgb_s, a_raw.clamp(0.0, 1.0)], dim=0)
 
 
 def _lg(p):

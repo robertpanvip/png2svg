@@ -290,10 +290,43 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - 判定：跑 `diag_arch` 看 (a) 预测类别分布是否出现非 blob 类（polygon/ellipse/rect/stroke）；(b) `oracle_cls` 是否从 +2.2% 升到 >10%；(c) `oracle_cls_bbox` 天花板是否抬高；(d) 诊断 mae 不显著退步（类修复不应牺牲渲染）。
 - 若类分布 diversify 且 oracle_cls>10% → 类头有救，继续长训 ~32k 巩固，fix_cls 成新最佳（并顺带验证 §5.2.7 路线正确）；若仍 100% blob → 上 soft class mixing（渲染类可微）。
 
+**结论（2026-09-09，task zXa7bx 完成 + 同口径 diag_arch）：➜ B1 失败，强平衡 CE + 提权未能打破 blob 坍缩。**
+| 指标 | fix20k（基线） | fix_cls（B1: w_cls 1.5 + 平衡） | 判定 |
+|------|----------------|----------------------------------|------|
+| 预测类别分布 | 240/240 blob | **240/240 blob（无改善）** | ❌ 类头仍恒选 blob |
+| cls logits 熵 | 0.995 | 1.190（更不决断但 argmax 仍 blob） | ❌ |
+| oracle_cls 增益 | +2.3% | **+1.1%（↓ 退步）** | ❌ 给真类反而更无益 |
+| oracle_bbox 增益 | +8.3% | +6.0%（↓） | ❌ |
+| oracle_cls_bbox 增益 | +16.2% | +11.8%（↓） | ❌ |
+| 匹配 GT 对象 | 90/119 | 82/119（↓） | ❌ |
+
+**根因坐实**：渲染损失对类**不变**（硬 `argmax` 选类 + blob 自由多边形可逼近任意轮廓），render+geom 梯度（权重 1.0+0.7）压倒 cls CE（即便 1.5× + 平衡）→ 模型理性地选"通用匹配器 blob"。`oracle_cls` 仅 +1~2% 说明类选择对像素目标**结构性无关**——纯辅助 CE（无论多强）无法赋予类头"区分 blob/ellipse"的渲染激励。**下一步必须让渲染对类可微**：soft class mixing（§5.2.7.2）。
+
+### 5.2.7.2 实验 C1：soft class mixing（渲染对类可微，已实现，验证训练中）
+
+> 核心思想：每个 slot 不再硬选一类，而是渲染**全部 5 种形状变体**（blob/polygon/ellipse/rect/stroke，几何均从同一 slot 张量构造），按 `softmax(cls_logits)` 加权混合成一层再合成。这样"选椭圆 vs 选 blob"会渲染出明显不同的图，render 梯度即可反传回 cls 头，结构上打破坍缩。
+
+**代码改动（已完成，待提交）：**
+- `model/spec.py`：
+  - 抽出 `_build_obj(slots_raw, f, k, cls, ftype, canvas, pad_px)`（原 `slots_to_objs` 逐 slot 构造逻辑上移，硬/软两路径共用）。
+  - 新增 `slots_to_objs_soft(slots_raw, ftype_ids, bg_raw, canvas, pad_px)`：每 slot 构造 5 个候选 dict + 原始 `cls_logits = slots_raw[..., I_CLS:I_CLS+NUM_CLS]`。
+  - 新增 `render_soft_objs(ren, groups, bg)`：按 softmax(cls_logits) 混合每 slot 的 5 个层（premultiplied 约定，与 SoftSVGRenderer `_render_objs` 一致），逐对象 alpha-over 合成；**逐候选 `torch.utils.checkpoint.checkpoint` 释放激活**，避免 5× 形状层同时驻留显存（4GB 卡实测从 OOM 降到可跑）。
+- `train.py`：新增 `--soft-cls` 开关；`train_step` 在 `--soft-cls` 下走 `slots_to_objs_soft` + `render_soft_objs`（cls_logits 直连网络输出，梯度贯通），否则保持原硬 `slots_to_objs` 路径。
+- 注：`slots_to_objs`（硬 argmax）保持不变，evaluate.py / 非 soft 训练均不受影响。
+
+**梯度验证（50 步冒烟，已通过）：**
+- `cls_logits` 接收的渲染梯度 **norm=0.17**（min −0.080 / max +0.084，有限、无 NaN）——**此前渲染梯度对 cls 头为 0，现在首次非零**，证明 soft mixing 让渲染对类可微。
+- resume fix20k 干净加载，无 missing/unexpected 键；参数 4,699,441（含 spatial_anchor）。
+
+**运行（2026-09-09，验证训练，后台 task 待启动）：**
+- 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --w-cls 1.5 --soft-cls --out runs/fix_soft`（20k→24k 新增 4k；~5× 渲染成本，预计 60–80min，比前几轮慢）。
+- 判定：run `diag_arch` 看 (a) 预测类别分布是否出现非 blob 类；(b) `oracle_cls` 是否从 +1.1% 升到 >10%；(c) 诊断 mae 不显著退步（类修复不应牺牲渲染）。
+- 若类分布 diversify 且 oracle_cls>10% → 类头有救，继续长训 ~32k 巩固，fix_soft 成新最佳；若仍 100% blob → 类头/特征结构需重构（类无关几何 + 类特定外观解耦，或更大 decoder）。
+
 ## 6. 关键文件索引
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
-model/spec.py       slots_to_objs / predictions_to_targets / squash_*
+model/spec.py       slots_to_objs（硬 argmax）/ slots_to_objs_soft + render_soft_objs（soft class mixing）/ predictions_to_targets / squash_*
 model/matching.py   （新增）O(n³) Hungarian slot↔GT 匹配解算器
 model/network.py    VectorNet + spatial_anchor 网格空间先验（anchor-free 已还原，见 §5.2.6）
 model/losses.py     matched_auxiliary_losses（匹配版，含 cls_balance 类别平衡 CE）+ spatial_diversity
@@ -457,7 +490,7 @@ backward 44%（含 checkpoint 重算）、GT 渲染 18%、可微渲染 16%、**s
 ## 10. 关键文件索引（增量更新）
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
-model/spec.py       slots_to_objs / predictions_to_targets / squash_*
+model/spec.py       slots_to_objs（硬 argmax）/ slots_to_objs_soft + render_soft_objs（soft class mixing）/ predictions_to_targets / squash_*
 model/matching.py   slot↔GT 匈牙利匹配（§5.2.2 修复，新增）
 benchmarks/diag_query.py   slot 退化检查：query/输出余弦相似度 + bbox 中心方差（§5.2.1）
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（§7.3）
