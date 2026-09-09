@@ -227,13 +227,36 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 2. **真实图片泛化**：拿真实图标 PNG 跑 `benchmarks/infer.py`，验证泛化（训练分布=SceneGenerator 合成）。
 3. 训练侧：暂停，边际收益已负。
 
+### 5.2.6 anchor-free 架构大改：注意力质心空间先验（用户授权，运行中）
+
+> 根因（§5.2.5 结论）：bbox 中心精度（oracle_bbox +6.4%）是硬网格锚点的伴生代价——网格先验同时是 slot 消歧的解药与 grid-bias 的病根，调参绕不开。真正突破 = 去掉硬编码网格，让空间先验从图像本身来。
+> 设计（用户选"注意力质心"方案）：删 `spatial_anchor`，改用 cross-attn 注意力权重算出的**质心**作为数据驱动空间先验（模型看哪、中心就在哪），bbox 中心 L1 梯度反传回注意力使其聚焦；加注意力熵正则（`w_cent`）鼓励每个 slot 看向紧凑区域，防质心扩散回中心。
+
+**代码改动（已完成，待提交）：**
+- `model/network.py`：
+  - 删 `spatial_anchor` 参数与 forward 的网格偏移。
+  - `DecoderLayer.forward` 返回最后一层 cross-attn 权重 `(B, num_slots, grid*grid)`。
+  - `VectorNet.forward(img, centroid_scale=1.0)`：新增 `_centroid_logit(attn_w, grid, device)` —— 权重 softmax 后按网格坐标算质心 `(cx,cy)∈0..1`，转成 `_lin` 逆变换 logit 加到 bbox cx/cy；同时返回平均注意力熵 `aux["cent_entropy"]`。该质心随图像/对象变化（非固定模板），故无 grid-bias。
+- `model/losses.py`：`compute_losses` 新增 `w_cent`（默认 0.05），`aux_total += w_cent * cent_entropy`；`parts` 加 `cent`。
+- `train.py`：删 `--anchor-scale/--anchor-anneal-*/--freeze-anchor`，改 `--centroid-scale`（默认 1.0）与 `--w-cent`（默认 0.05）；resume 用 `load_state_dict(strict=False)` 容忍旧 ckpt 的 `spatial_anchor`，优化器状态架构不匹配时自动重置（fresh optimizer）；日志加 `cent=`。
+- 参数预算：4,699,425（删 spatial_anchor 后仍达标）。
+
+**运行（2026-09-09，task zwkWj3）：**
+- 冒烟（50 步）：resume fix20k 容忍架构变化正常；`cent≈5.544`（≈ln256 最大熵）→ 注意力初始完全弥散，模型此前靠网格定位、cross-attn 未聚焦，去除锚点后质心退化到中心——**正是关键风险点，需验证能否聚焦**。
+- 正式验证：`--resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --centroid-scale 1.0 --w-cent 0.15 --w-bbox 0.5 --out runs/fix_af`（新增 4k 步，约 25min）。
+- 判定：跑 `diag_query`/`diag_arch`，看 (a) `cent` 熵从 5.54 明显下降（注意力聚焦）；(b) 中心方差 >0.01 且**中心分布不再钉在 (0.23,0.21) 网格点**（grid-bias 消失）；(c) oracle_bbox 从 +6.4% 回落、(d) 诊断 mae < 0.0769。
+
+**预期与风险：**
+- 若注意力聚焦 + grid-bias 消失 → anchor-free 成功，继续长训到 ~32k 巩固，fix_af 成新最佳。
+- 若 `cent` 仍 ~5.54、中心回退到 (0.5,0.5) → cross-attn 在 4k 内学不会定位，需**从随机初始化从头训**（DETR 式，更长步数）或加大 `w_cent`/加每层辅助损失。fix20k 仍保留为最佳。
+
 ## 6. 关键文件索引
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
 model/matching.py   （新增）O(n³) Hungarian slot↔GT 匹配解算器
-model/network.py    VectorNet + spatial_anchor 空间锚点先验
-model/losses.py     matched_auxiliary_losses（匹配版）+ spatial_diversity 正则
+model/network.py    VectorNet + 注意力质心 anchor-free 空间先验（§5.2.6）
+model/losses.py     matched_auxiliary_losses（匹配版）+ spatial_diversity + cent_entropy 正则
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（新增）
 benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（新增）
 benchmarks/diag_arch.py     架构诊断：oracle ablation（新增）

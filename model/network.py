@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import math
 
 from model.targets import NUM_SLOTS, SLOT_DIM, BG_DIM, NUM_CLS, I_BBOX
+from model.spec import C_MIN, C_MAX
 
 
 class ConvBlock(nn.Module):
@@ -70,9 +71,36 @@ class DecoderLayer(nn.Module):
         x = self.n1(q)
         q = q + self.self_attn(x, x, x, need_weights=False)[0]
         x = self.n2(q)
-        q = q + self.cross_attn(x, kv, kv, need_weights=False)[0]
+        # 返回最后一层 cross-attn 权重（B, num_slots, N_tokens），用于注意力质心定位
+        ca_out, ca_w = self.cross_attn(x, kv, kv, need_weights=True)
+        q = q + ca_out
         q = q + self.ffn(self.n3(q))
-        return q
+        return q, ca_w
+
+
+def _centroid_logit(attn_w: torch.Tensor, grid: int, device: torch.device):
+    """从 cross-attn 权重 (B, num_slots, grid*grid) 求每个 slot 的注意力质心，
+    转成 bbox cx/cy 的 logit 偏移（与 spatial_anchor 同约定：_lin 逆变换）。
+    返回 centroid_logit (B, num_slots, 2) 与平均注意力熵（鼓励聚焦）。"""
+    b, ns, n = attn_w.shape
+    g = grid
+    # 网格坐标 (g,g) -> 0..1 canvas 坐标
+    idx = torch.arange(g * g, device=device, dtype=attn_w.dtype).reshape(g, g)
+    xs = ((idx % g) + 0.5) / g
+    ys = ((idx // g) + 0.5) / g
+    xs = xs.reshape(-1)  # (n,)
+    ys = ys.reshape(-1)
+    w = attn_w.softmax(-1)  # (B, ns, n)
+    cx = torch.einsum("bsn,n->bs", w, xs)  # (B, ns)
+    cy = torch.einsum("bsn,n->bs", w, ys)
+    cx = cx.clamp(C_MIN + 1e-3, C_MAX - 1e-3)
+    cy = cy.clamp(C_MIN + 1e-3, C_MAX - 1e-3)
+    cx_lg = torch.log((cx - C_MIN) / (C_MAX - cx))
+    cy_lg = torch.log((cy - C_MIN) / (C_MAX - cy))
+    centroid_logit = torch.stack([cx_lg, cy_lg], dim=-1)  # (B, ns, 2)
+    # 注意力熵（越小越聚焦）；鼓励每个 slot 看向一个紧凑区域
+    entropy = -(w * (w + 1e-8).log()).sum(-1).mean()
+    return centroid_logit, entropy
 
 
 class VectorNet(nn.Module):
@@ -95,24 +123,12 @@ class VectorNet(nn.Module):
         self.cls_head = nn.Linear(d_model, NUM_CLS)
         self.ftype_head = nn.Linear(d_model, 4)
         self.bg_head = nn.Linear(d_model, BG_DIM)
-        # 空间锚点先验：强制每个 slot 偏向画布不同区域，打破 bbox 中心坍缩。
-        # 加到 bbox 的 cx/cy 原始 logit 上（squash 用 _lin 把 logit 映射到 [-0.2,1.2]）。
-        self.spatial_anchor = nn.Parameter(torch.zeros(num_slots, 2))
-        C_MIN, C_MAX = -0.20, 1.20
-        cols, rows = 4, 2
-        with torch.no_grad():
-            for k in range(num_slots):
-                r, c = divmod(k, cols)
-                gx = (c + 0.5) / cols          # 期望中心（canvas 坐标 0..1）
-                gy = (r + 0.5) / rows
-                ax = math.log((gx - C_MIN) / (C_MAX - gx))   # logit 逆变换
-                ay = math.log((gy - C_MIN) / (C_MAX - gy))
-                self.spatial_anchor[k, 0] = ax
-                self.spatial_anchor[k, 1] = ay
+        # anchor-free：不再有固定网格 spatial_anchor。空间定位来自 cross-attn 注意力质心
+        # （数据驱动），由 forward 的 centroid_scale 控制强度。
         n_params = sum(p.numel() for p in self.parameters())
         assert 3_000_000 <= n_params <= 8_000_000, f"param budget violated: {n_params}"
 
-    def forward(self, img, anchor_scale: float = 1.0):
+    def forward(self, img, centroid_scale: float = 1.0):
         feats = self.encoder(img)
         b = feats.shape[0]
         pos = self.pos_emb
@@ -121,15 +137,18 @@ class VectorNet(nn.Module):
                                 align_corners=False)
         tokens = (feats + pos).flatten(2).transpose(1, 2)
         q = self.queries.expand(b, -1, -1)
+        last_ca = None
         for layer in self.layers:
-            q = layer(q, tokens)
+            q, ca = layer(q, tokens)
+            last_ca = ca
         h = self.final_norm(q)
         slots = self.slot_head(h)
-        # 空间锚点先验按 anchor_scale 缩放：训练早期=1.0 打破对称坍缩，
-        # 后期退火到 0 让对象学到任意连续位置（消除网格偏置）。
-        slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
-                                         + self.spatial_anchor * anchor_scale)
         aux = {"cls": self.cls_head(h), "ftype": self.ftype_head(h)}
+        if centroid_scale != 0.0 and last_ca is not None:
+            centroid_logit, entropy = _centroid_logit(last_ca, self.grid, tokens.device)
+            slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
+                                             + centroid_logit * centroid_scale)
+            aux["cent_entropy"] = entropy
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg
 
