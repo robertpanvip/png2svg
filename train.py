@@ -29,6 +29,8 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--w-cls", type=float, default=0.3)
     p.add_argument("--w-ftype", type=float, default=0.3)
+    p.add_argument("--no-cls-balance", action="store_true",
+                   help="关闭类别平衡 CE（用均匀权重，便于对照消融）")
     p.add_argument("--w-valid", type=float, default=0.1)
     p.add_argument("--w-svalid", type=float, default=0.1)
     p.add_argument("--w-geom", type=float, default=0.7)
@@ -91,7 +93,8 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
                                   w_cls=args.w_cls, w_ftype=args.w_ftype,
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
-                                  w_div=args.w_div, w_bbox=args.w_bbox)
+                                  w_div=args.w_div, w_bbox=args.w_bbox,
+                                  cls_balance=not args.no_cls_balance)
     total.backward()
     return total.detach(), parts
 

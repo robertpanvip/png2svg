@@ -275,13 +275,28 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 > 3. 提高 `w_cls`（当前偏低）→ 观察 cls 熵与 oracle_cls 是否上升。
 > 4. **验证判据**：若 `oracle_cls` 从 +2.2% 升到 >10% 且预测分布出现非 blob 类，说明类头有救、空间+类双修可推进；若仍 100% blob，则类头/特征结构需重构（如类无关几何 + 类特定外观解耦）。
 
+### 5.2.7.1 实验 B1：类别平衡 CE + 提 w_cls（用户授权，运行中 task zXa7bx）
+> 代码调研结论（落地前）：`cls` 头**确有**梯度来自 `matched_auxiliary_losses` 的 `F.cross_entropy`（losses.py:151，仅匹配对、权重 w_cls 默认 0.3）；渲染损失对类不变（slots_to_objs 硬 argmax 选类 + blob 曲线逼近任意轮廓），故渲染梯度从不惩罚"该椭圆却预测 blob"。
+> 坍缩机制：渲染(1.0)+几何(0.7) 用 blob 即可匹配轮廓，cls CE(0.3) 既弱又遇类别不平衡（blob 占 44%）→ 模型学会永远预测 blob。
+
+**代码改动（已完成，待提交）：**
+- `model/losses.py`：新增模块常量 `CLS_BAL_W`（基于 generator.shape_weights 逆频率，blob 归一到 1.0 → `[1.0, 1.75, 2.33, 2.33, 2.33]`）；`matched_auxiliary_losses` / `auxiliary_losses` / `compute_losses` 加 `cls_balance: bool=True` 参数，`cls` CE 接 `weight=CLS_BAL_W.to(device)`。
+- `train.py`：加 `--no-cls-balance` 开关（消融对照用）；`compute_losses` 透传 `cls_balance=not args.no_cls_balance`。
+- 注：未改渲染路径（保持类硬开关）。先验证"强平衡 CE + 提权"是否足以教类头（我们有 GT 类标签，CE 本可监督类，之前是权重/平衡不够）。若仍坍缩再上 soft class mixing（让渲染对类可微）。
+
+**运行（2026-09-09，task zXa7bx）：**
+- 50 步冒烟通过：resume fix20k 干净加载（无 missing/unexpected 键）、CLS_BAL_W 设备对齐正常；params=4,699,441（含 spatial_anchor 8×2=16）。
+- 正式验证：`--resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --w-cls 1.5 --out runs/fix_cls`（20k→24k 新增 4k，约 25min）。
+- 判定：跑 `diag_arch` 看 (a) 预测类别分布是否出现非 blob 类（polygon/ellipse/rect/stroke）；(b) `oracle_cls` 是否从 +2.2% 升到 >10%；(c) `oracle_cls_bbox` 天花板是否抬高；(d) 诊断 mae 不显著退步（类修复不应牺牲渲染）。
+- 若类分布 diversify 且 oracle_cls>10% → 类头有救，继续长训 ~32k 巩固，fix_cls 成新最佳（并顺带验证 §5.2.7 路线正确）；若仍 100% blob → 上 soft class mixing（渲染类可微）。
+
 ## 6. 关键文件索引
 ```
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
 model/matching.py   （新增）O(n³) Hungarian slot↔GT 匹配解算器
 model/network.py    VectorNet + spatial_anchor 网格空间先验（anchor-free 已还原，见 §5.2.6）
-model/losses.py     matched_auxiliary_losses（匹配版）+ spatial_diversity + cent_entropy 正则
+model/losses.py     matched_auxiliary_losses（匹配版，含 cls_balance 类别平衡 CE）+ spatial_diversity
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（新增）
 benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（新增）
 benchmarks/diag_arch.py     架构诊断：oracle ablation（新增）

@@ -15,6 +15,13 @@ from model.targets import (
 from model.spec import squash_slots, squash_bg
 from model.matching import match_slots
 
+# 类别平衡权重：基于 dataset/generator.py shape_weights 逆频率，blob 归一到 1.0。
+# blob0.35 / polygon0.20 / ellipse0.15 / rect0.15 / stroke0.15
+# -> 1/0.35 : 1/0.20 : 1/0.15 : 1/0.15 : 1/0.15 = 1.0 : 1.75 : 2.33 : 2.33 : 2.33
+_CLS_PRIOR = (0.35, 0.20, 0.15, 0.15, 0.15)
+CLS_BAL_W = torch.tensor([1.0 / p for p in _CLS_PRIOR], dtype=torch.float32)
+CLS_BAL_W = CLS_BAL_W / CLS_BAL_W[0]
+
 
 def _ssim_mean(img_pred: torch.Tensor, img_gt: torch.Tensor, window: int = 7) -> torch.Tensor:
     x = img_pred.unsqueeze(0)
@@ -100,7 +107,7 @@ def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor) -> torch.Ten
 
 
 def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux: dict,
-                             slots_gt, bg_gt) -> dict:
+                             slots_gt, bg_gt, cls_balance: bool = True) -> dict:
     """带 Hungarian 匹配的辅助损失。
 
     每一步把 8 个预测 slot 与 8 个 GT 对象做最优一一匹配，再在匹配对上算
@@ -148,7 +155,8 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux:
         pred_idx = torch.tensor(matched_pred, device=device)
         gt_idx = torch.tensor([g for g in range(n) if assign[g] >= 0], device=device)
         valid_target[pred_idx] = 1.0
-        parts["cls"] = F.cross_entropy(cls_logits[pred_idx], cls_gt[gt_idx])
+        parts["cls"] = F.cross_entropy(cls_logits[pred_idx], cls_gt[gt_idx],
+                                      weight=CLS_BAL_W.to(device) if cls_balance else None)
         parts["ftype"] = F.cross_entropy(ft_logits[pred_idx], ft_gt[gt_idx])
         f_g = {key: val[pred_idx] for key, val in f.items()}
         pred_raw_g = slots_raw[pred_idx]
@@ -187,9 +195,10 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux:
 
 
 def auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux: dict,
-                     slots_gt, bg_gt) -> dict:
+                     slots_gt, bg_gt, cls_balance: bool = True) -> dict:
     """兼容旧接口：直接转发到匹配版。"""
-    return matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt)
+    return matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt,
+                                    cls_balance=cls_balance)
 
 
 def spatial_diversity(slots_raw: torch.Tensor) -> torch.Tensor:
@@ -213,9 +222,11 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_cls: float = 0.3, w_ftype: float = 0.3,
                    w_valid: float = 0.1, w_svalid: float = 0.1,
                    w_geom: float = 0.7, w_bg: float = 0.2,
-                   w_div: float = 0.05, w_bbox: float = 0.5) -> tuple:
+                   w_div: float = 0.05, w_bbox: float = 0.5,
+                   cls_balance: bool = True) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
-    a = matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt)
+    a = matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt,
+                                cls_balance=cls_balance)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
                  + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"])
