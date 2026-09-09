@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.ao.quantization import quantize_dynamic
 
-from benchmarks.prune import prune_scene
+from benchmarks.prune import prune_scene, prune_scene_greedy
 from model.network import VectorNet
 from model.spec import predictions_to_targets
 from model.targets import decode_scene
@@ -48,8 +48,12 @@ def load_png(path: str, size: int) -> torch.Tensor:
 
 
 def predict(net, img_in: torch.Tensor, size: int,
-            prune_threshold: float = 0.002):
-    """返回 (svg_str, info)。纯 CPU。"""
+            prune_threshold: float = 0.002, prune_mode: str = "greedy"):
+    """返回 (svg_str, info)。纯 CPU。
+
+    prune_mode: "greedy"（贪心迭代，抗 slot 重复绘制，O(N²) 渲染）
+                | "independent"（独立消融，快但会被副本掩盖）
+    """
     t0 = time.perf_counter()
     with torch.no_grad():
         slots, aux, bg = net(img_in.unsqueeze(0))
@@ -60,8 +64,8 @@ def predict(net, img_in: torch.Tensor, size: int,
 
     t0 = time.perf_counter()
     if prune_threshold > 0:
-        pruned, info = prune_scene(scene_pred, img_in, size,
-                                   threshold=prune_threshold)
+        fn = prune_scene_greedy if prune_mode == "greedy" else prune_scene
+        pruned, info = fn(scene_pred, img_in, size, threshold=prune_threshold)
     else:
         pruned, info = scene_pred, {"n_before": len(scene_pred.objects),
                                     "n_after": len(scene_pred.objects),
@@ -82,6 +86,8 @@ def main():
     ap.add_argument("--bench", action="store_true", help="跑 10 场景延迟基准")
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--prune-threshold", type=float, default=0.002)
+    ap.add_argument("--prune-mode", default="greedy", choices=["greedy", "independent"],
+                    help="greedy=贪心迭代（默认，抗 slot 重复绘制）；independent=独立消融（快）")
     ap.add_argument("--no-prune", action="store_true")
     ap.add_argument("--out", default="", help="SVG 输出路径（可选）")
     args = ap.parse_args()
@@ -98,7 +104,8 @@ def main():
             scene = gen.sample()
             rgba = soft.render_scene(scene)
             _, info = predict(net, rgba, args.size,
-                              0.0 if args.no_prune else args.prune_threshold)
+                              0.0 if args.no_prune else args.prune_threshold,
+                              prune_mode=args.prune_mode)
             net_ms.append(info["net_ms"])
             prune_ms.append(info["prune_ms"])
             tot_ms.append(info["total_ms"])
@@ -128,7 +135,8 @@ def main():
         ap.error("must provide --png or --sample or --bench")
 
     svg_str, info = predict(net, rgba, args.size,
-                            0.0 if args.no_prune else args.prune_threshold)
+                            0.0 if args.no_prune else args.prune_threshold,
+                            prune_mode=args.prune_mode)
     print(f"[predict] net={info['net_ms']:.1f}ms prune={info['prune_ms']:.1f}ms "
           f"total={info['total_ms']:.1f}ms "
           f"objs={info['prune']['n_before']}->{info['prune']['n_after']}")

@@ -89,3 +89,59 @@ def prune_scene(scene_pred: Scene, img_in: torch.Tensor, size: int,
         "delta_per_obj": deltas,
     }
     return pruned, info
+
+def prune_scene_greedy(scene_pred: Scene, img_in: torch.Tensor, size: int,
+                       threshold: float = 0.002, keep_indices=None) -> tuple[Scene, dict]:
+    """贪心迭代剪枝：每轮移除 Δ 最小的冗余对象后重算 Δ。
+
+    背景（2026-09-10 40k 验收发现）：模型存在 slot 重复绘制（多副本覆盖同一
+    区域），独立逐对象消融时每个对象的 Δ 都被"副本"掩盖（剪任何一个都有
+    别的顶着 → Δ≈0 → 全部被剪）。贪心法每剪掉一个副本，剩余副本的真实
+    贡献才会在下一轮显形，最终每个保留对象都是不可替代的。
+
+    代价：O(N²) 次 resvg 渲染（N=8 时 ≤36 次 ×~20ms ≈ 0.7s CPU）；
+    超过 1s 预算时可调大 threshold 或退回 prune_scene（独立消融）。
+    """
+    objs = list(scene_pred.objects)
+    keep = set(keep_indices or [])
+    dropped = []
+    mae_full = _mae(render_scene_resvg(scene_pred, size, size), img_in)
+
+    def mae_of(obj_list):
+        if not obj_list:
+            sc = Scene(width=scene_pred.width, height=scene_pred.height,
+                       background=scene_pred.background, objects=[])
+        else:
+            sc = Scene(width=scene_pred.width, height=scene_pred.height,
+                       background=scene_pred.background, objects=obj_list)
+        return _mae(render_scene_resvg(sc, size, size), img_in)
+
+    cur = objs
+    while True:
+        cur_mae = mae_of(cur)
+        removable = [i for i in range(len(cur)) if i not in keep]
+        if not removable:
+            break
+        best_i, best_d = None, threshold
+        for i in removable:
+            d = mae_of(cur[:i] + cur[i + 1:]) - cur_mae
+            if d <= threshold and (best_i is None or d < best_d):
+                best_i, best_d = i, d
+        if best_i is None:
+            break
+        dropped.append(best_i)
+        cur = cur[:best_i] + cur[best_i + 1:]
+
+    kept_idx = [i for i in range(len(objs)) if i not in dropped]
+    pruned = Scene(width=scene_pred.width, height=scene_pred.height,
+                   background=scene_pred.background, objects=cur)
+    mae_pruned = _mae(render_scene_resvg(pruned, size, size), img_in)
+    info = {
+        "n_before": len(objs), "n_after": len(cur),
+        "n_dropped": len(dropped), "dropped_idx": dropped,
+        "threshold": threshold, "mode": "greedy",
+        "mae_full": mae_full, "mae_pruned": mae_pruned,
+        "mae_delta": mae_pruned - mae_full,
+        "delta_per_obj": [],
+    }
+    return pruned, info

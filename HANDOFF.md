@@ -664,3 +664,17 @@ compose  I_GROUP=264(4 one-hot) I_CLIP=268 I_CLIP_REF=269
 | oracle_seg / nseg_gap | +0.0016 / −1.78 | 段数偏少 1.8 段 |
 
 **判定：PASS，三项全过。blob 万能类坍缩在结构上消灭生效**——匹配满分、类型多样化、mae 显著优于旧表示。短板：Q 段预测为 0（被 C 吸收，渲染无损）、L 准确率 0.26、欠分段 1.8 段。40k 续训后台运行中（`runs/newrep_train2.log`，预计 ~02:50），06:40 晨报自动化做 40k 终诊 + 部署复测。验收详情：`runs/newrep/ACCEPTANCE_24K.md`；诊断数据：`runs/diag_new_24k.json`、`runs/eval_newrep24k.json`。
+
+### 11.10 40k 终验 + 外观瓶颈定位（2026-09-10 03:30，晨报）
+
+40k 结果（`diag_new` 50 场景）：mae 0.0531（24k→40k 仅 +2%，饱和）、匹配 212/212、类型 C:804/L:178/A:122/M:212、A/L/C acc .61/.34/.90、nseg_gap −2.15、Q 仍为 0（被 C 吸收）。CPU p95 ~33ms。**同配置不再加步数（收益递减，不盲训）。**
+
+**外观瓶颈（新表示下依然存在，与表示无关，P0）：**
+- 误差分解（12 场景）：对象净收益 mean **−0.011**，10/12 场景画对象比纯背景更差；背景预测 (0.16,0.15,0.17) vs GT 黑色——平凡背景都未学会。
+- fill 头已激活（alpha=1.0、ftype none/solid 对半）但 rgb 学极慢（亮度 0.375）；预测对象=灰色细条（`runs/newrep/vis_seed0_*.png`）。
+- 归因：几何有直接辅助监督（bbox L1+类型 NLL+坐标 L1）故学得快；**fill 颜色/覆盖只有渲染 MAE 间接梯度 → 学不动**。与旧表示"对象让 mae 比不画还高"同一病根。
+- 修法（下一步 P0）：匹配对上 fill rgb/alpha 直接 L1 监督；bg 颜色监督检查（w_bg/编码）；覆盖 warmup。
+
+**prune 升级**：`prune_scene_greedy`（贪心迭代，逐层剥冗余副本；O(N²) 渲染 N=8 时 ~0.3-0.7s）替代独立消融成为 deploy 默认。当前权重剪后为空是**正确行为**（对象无不可替代贡献）。
+
+部署包定稿：fp32 19.21MB / INT8 16.72MB / CPU net 19-27ms。晨报：`runs/newrep/MORNING_REPORT.md`。
