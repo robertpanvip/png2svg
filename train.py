@@ -34,6 +34,8 @@ def parse_args():
     p.add_argument("--w-geom", type=float, default=0.7)
     p.add_argument("--w-bg", type=float, default=0.2)
     p.add_argument("--w-div", type=float, default=0.05)
+    p.add_argument("--w-bbox", type=float, default=0.5,
+                   help="匹配对象 cx/cy 专项 L1 监督权重，提升 bbox 中心精度")
     p.add_argument("--anchor-scale", type=float, default=1.0,
                    help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
     p.add_argument("--anchor-anneal-start", type=int, default=99999999,
@@ -89,7 +91,7 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
                                   w_cls=args.w_cls, w_ftype=args.w_ftype,
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
-                                  w_div=args.w_div)
+                                  w_div=args.w_div, w_bbox=args.w_bbox)
     total.backward()
     return total.detach(), parts
 
@@ -141,7 +143,7 @@ def main():
 
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
-            "geom", "bg", "div", "aux", "total"]
+            "geom", "bbox", "bg", "div", "aux", "total"]
     avg = {k: 0.0 for k in keys}
     t0 = time.time()
     n_log = 0
@@ -170,7 +172,8 @@ def main():
                 f.write(json.dumps(rec) + "\n")
             print(f"[{step + 1}/{args.steps}] total={m['total']:.4f} "
                   f"render={m['render']:.4f} mae={m['mae']:.4f} "
-                  f"geom={m['geom']:.4f} asc={a_scale:.2f} gn={float(gn):.2f} "
+                  f"geom={m['geom']:.4f} bbox={m['bbox']:.4f} "
+                  f"asc={a_scale:.2f} gn={float(gn):.2f} "
                   f"({sps:.2f} it/s)", flush=True)
             avg = {k: 0.0 for k in keys}
             n_log = 0

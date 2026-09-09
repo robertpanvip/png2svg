@@ -154,10 +154,16 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux:
         pred_raw_g = slots_raw[pred_idx]
         gt_g = gt[gt_idx]
         geom = _geom_block(f_g, pred_raw_g, gt_g)
+        # cx/cy 专项 L1：匹配对上把中心拉向 GT 中心，直接提升 bbox 位置精度
+        # （geom 已含 cx/cy/w/h 联合 L1，此处额外加权中心以抑制网格偏置残留）
+        parts["bbox"] = F.l1_loss(
+            torch.stack([f_g["cx"], f_g["cy"]], dim=1),
+            gt_g[:, I_BBOX:I_BBOX + 2])
     else:
         parts["cls"] = slots_raw.sum() * 0.0
         parts["ftype"] = slots_raw.sum() * 0.0
         geom = slots_raw.sum() * 0.0
+        parts["bbox"] = slots_raw.sum() * 0.0
 
     parts["valid"] = F.binary_cross_entropy(
         f["valid"].clamp(1e-6, 1.0 - 1e-6), valid_target)
@@ -207,12 +213,12 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_cls: float = 0.3, w_ftype: float = 0.3,
                    w_valid: float = 0.1, w_svalid: float = 0.1,
                    w_geom: float = 0.7, w_bg: float = 0.2,
-                   w_div: float = 0.05) -> tuple:
+                   w_div: float = 0.05, w_bbox: float = 0.5) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
     a = matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
-                 + w_div * spatial_diversity(slots_raw))
+                 + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"])
     total = r["total"] + aux_total
     parts = {"mae": float(r["mae"].detach()),
              "ssim": float(r["ssim"].detach()),
@@ -222,6 +228,7 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
              "valid": float(a["valid"].detach()),
              "svalid": float(a["svalid"].detach()),
              "geom": float(a["geom"].detach()),
+             "bbox": float(a["bbox"].detach()),
              "bg": float(a["bg"].detach()),
              "div": float(spatial_diversity(slots_raw).detach()),
              "aux": float(aux_total.detach()),

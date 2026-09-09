@@ -191,7 +191,32 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - **当前最佳可用 ckpt = `runs/fix20k/last.pt`**（锚点固定，诊断 mae 0.0769 优于 fix_anchor 0.0814）。
 - 修复带来的真实收益已坐实：原 20k 未修复 oracle_bbox +11.3% → fix20k +6.4%（bbox 误差减半），中心方差 0.000026→0.0478（坍缩彻底打破）。
 
-**下一步（待定，未执行）：** 锚点不应降到 0，应保留**弱先验 floor≈0.3**（`--anchor-scale 0.3` 不退火，或退火到 floor 而非 0）。此外 oracle 显示 bbox 中心仍有 +6.4% 空间，建议**对匹配对象加 cx/cy 专项 L1 监督**（让网络在锚点附近精修到 GT 中心）比继续堆步数更有效。阶段优先级：弱锚点重训 > bbox 中心专项监督 > 类别 mode collapse（cls 影响仅 +1.7%，最低优先）。
+**下一步（已采纳，见 §5.2.5）：** 锚点不应降到 0，应保留**弱先验 floor≈0.3**（`--anchor-scale 0.3` 不退火，或退火到 floor 而非 0）。此外 oracle 显示 bbox 中心仍有 +6.4% 空间，建议**对匹配对象加 cx/cy 专项 L1 监督**（让网络在锚点附近精修到 GT 中心）比继续堆步数更有效。阶段优先级：弱锚点重训 > bbox 中心专项监督 > 类别 mode collapse（cls 影响仅 +1.7%，最低优先）。
+
+### 5.2.5 弱锚点 floor=0.3 + 匹配对象 cx/cy 专项 L1 监督（运行中）
+
+> 目标：在 fix20k 基础上，把锚点从"完全释放（次优）"修正为"弱固定先验（floor=0.3）"，并新增 cx/cy 专项 L1 直接把匹配对象中心拉向 GT，压低 oracle_bbox（+6.4%），目标诊断 mae < 0.0769（fix20k 基线）、并改善 bbox 中心偏移。
+
+**代码改动（本轮新增）：**
+- `train.py`：新增 `--w-bbox`（默认 0.5）权重参数；`--anchor-scale` 即 floor（设为 0.3 即弱先验，不退火到 0）；日志加 `bbox=` 项监控中心 L1。
+- `model/losses.py`：`matched_auxiliary_losses` 在 Hungarian 匹配对上新增 `parts["bbox"] = F.l1_loss(stack([f_cx,f_cy]), gt_bbox[cx,cy])`（仅匹配预测 slot，无匹配时为 0）；`compute_losses` 新增 `w_bbox` 参数并入 `aux_total`；`auxiliary_losses` 兼容接口同步返回（转发）。
+- `model/network.py`：无需改动——`anchor_scale=0.3` 已是弱先验地板机制。
+
+**运行（2026-09-09，task baZpC0）：**
+- 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 32000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --anchor-scale 0.3 --anchor-anneal-start 20000 --anchor-anneal-end 24000 --freeze-anchor --w-bbox 0.5 --out runs/fix_bbox`
+- 退火窗口 20k→24k（4000 步缓降 1.0→0.3），之后 8k 步在 asc=0.3 下自由精修；约 67min。
+- 50 步冒烟已验证：`asc` 1.00→0.30 平滑、bbox L1 项正常出现（~0.18-0.25）、无 NaN/爆炸、gn 被 clip 正常。
+
+**验证结果（待训练完，同 30 场景 seed=777000）：**
+| 指标 | fix20k（基线） | fix_bbox（弱锚+中心L1） | 判定 |
+|------|----------------|--------------------------|------|
+| 诊断 baseline mae | 0.0769 | **（待填）** | 应 < 0.0769 |
+| oracle_bbox 增益 | +6.4% | **（待填）** | 应回落 ~1-2% |
+| bbox 中心均值 | (0.23, 0.21) | **（待填）** | 应趋近 (0.5,0.5) |
+| 中心方差均值 | 0.0478 | **（待填）** | 应 > 0.01（坍缩不回退） |
+| 匹配 GT 对象 | 90/119 | **（待填）** | 应保持/提升 |
+
+**判定标准**：若诊断 mae < 0.0769 且 oracle_bbox 回落到 ~1-2%、中心均值趋近 0.5/0.5，则本轮达标，fix_bbox 成为新最佳 ckpt；否则分析原因（w_bbox 过大导致 w/h 欠拟合 / 锚点 floor 仍需调）。
 
 ## 6. 关键文件索引
 ```
