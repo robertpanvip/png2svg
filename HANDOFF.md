@@ -318,10 +318,24 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - `cls_logits` 接收的渲染梯度 **norm=0.17**（min −0.080 / max +0.084，有限、无 NaN）——**此前渲染梯度对 cls 头为 0，现在首次非零**，证明 soft mixing 让渲染对类可微。
 - resume fix20k 干净加载，无 missing/unexpected 键；参数 4,699,441（含 spatial_anchor）。
 
-**运行（2026-09-09，验证训练，后台 task 待启动）：**
-- 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --w-cls 1.5 --soft-cls --out runs/fix_soft`（20k→24k 新增 4k；~5× 渲染成本，预计 60–80min，比前几轮慢）。
-- 判定：run `diag_arch` 看 (a) 预测类别分布是否出现非 blob 类；(b) `oracle_cls` 是否从 +1.1% 升到 >10%；(c) 诊断 mae 不显著退步（类修复不应牺牲渲染）。
-- 若类分布 diversify 且 oracle_cls>10% → 类头有救，继续长训 ~32k 巩固，fix_soft 成新最佳；若仍 100% blob → 类头/特征结构需重构（类无关几何 + 类特定外观解耦，或更大 decoder）。
+**运行（2026-09-09，验证训练，后台 task K5n7X6 已完成）：**
+- 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --w-cls 1.5 --soft-cls --out runs/fix_soft`（20k→24k 新增 4k；~1.0 it/s，~70min）。
+- 训练收敛正常：末段 mae ≈ 0.070–0.075，bbox ≈ 0.185，无 NaN。
+
+**结论（2026-09-09）：C1 失败——soft mixing 梯度通了但不足以破坍缩。**
+同口径 `diag_arch`（30 场景，**注意：此时 generator 已重写为全 path 场景，旧 targets 编码器把所有 PathGeom 归为 blob，GT 分布退化为 blob:132 / 其他 0，类维度诊断仅在"全 path 数据 + 旧编码"管线内可比**）：
+
+| 指标 | fix20k（基线） | fix_soft（soft mixing +4k） |
+|---|---|---|
+| 诊断 mae | 0.0641 | 0.0637（持平） |
+| 匹配 | 52/132 | 48/132 |
+| oracle_cls | +0.0% | **+0.0%** |
+| 预测分布 | 240/240 blob | 240/240 blob |
+| bbox 预测中心 | (0.162, 0.141) | (0.155, 0.121)（仍中心坍缩） |
+
+判读：梯度通了（冒烟 norm=0.17）但 4k 步 + 渲染混合信号太弱，未能撬动 argmax 分布离开 blob；`oracle_cls` 归零也说明在"全 path"新数据下 5 类编码已无意义。**类坍缩问题被 §11 的表示重定向吸收**：新 taxonomy 里没有 blob 万能类（几何=路径段序列），5 类 CLS 将被段类型 one-hot 取代（任务 #24 targets 重编码）。fix_soft 不再继续长训，`runs/fix20k/last.pt` 仍为最佳可用权重。C1 的 soft-mixing 机制代码保留（`--soft-cls`），未来若做类无关几何+类特定外观解耦可复用。
+
+**附带修复**：generator 重写后 `svg/serializer.py` 不识别 CMD_A 导致诊断崩溃——已补弧段序列化（rx/ry 乘边长、rot/flag 绝对、终点 bbox.map），30 场景含弧 resvg 渲染验证通过。
 
 ## 6. 关键文件索引
 ```

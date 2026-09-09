@@ -5,7 +5,7 @@ import math
 from .scene_graph import (
     Scene, ShapeObject, PathGeom, CircleGeom, EllipseGeom, RectGeom, PolygonGeom,
     FILL_NONE, FILL_LINEAR, FILL_RADIAL,
-    CMD_M, CMD_L, CMD_Q, CMD_C, CMD_Z,
+    CMD_M, CMD_L, CMD_Q, CMD_C, CMD_A, CMD_Z,
 )
 
 _GRAD_MAX = 4096.0
@@ -38,6 +38,16 @@ def _path_d(path: PathGeom, size) -> str:
         pts = seg.pts
         if seg.cmd == CMD_Z:
             parts.append("Z")
+            continue
+        if seg.cmd == CMD_A:
+            # A 段 7 值: (rx, ry, rot, largearc, sweep, endx, endy)
+            # rx/ry 在 bbox uv 帧 -> 乘边长；rot/flag 绝对；终点 bbox.map
+            rx, ry, rot, la, sw, eux, euy = seg.pts
+            ex, ey = path.bbox.map(eux, euy)
+            parts.append(
+                f"A{_f(rx * w)} {_f(ry * h)} {_f(rot)} {int(la)} {int(sw)} "
+                f"{_f(ex * w)} {_f(ey * h)}"
+            )
             continue
         mapped = []
         for i in range(0, len(pts), 2):
