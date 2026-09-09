@@ -36,10 +36,14 @@ def parse_args():
     p.add_argument("--w-div", type=float, default=0.05)
     p.add_argument("--w-bbox", type=float, default=0.5,
                    help="匹配对象 cx/cy 专项 L1 监督权重，提升 bbox 中心精度")
-    p.add_argument("--centroid-scale", type=float, default=1.0,
-                   help="anchor-free：cross-attn 注意力质心作为空间先验的强度（数据驱动，无网格偏置）")
-    p.add_argument("--w-cent", type=float, default=0.05,
-                   help="注意力熵正则权重，鼓励每个 slot 聚焦到紧凑区域（防质心扩散回中心）")
+    p.add_argument("--anchor-scale", type=float, default=1.0,
+                   help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
+    p.add_argument("--anchor-anneal-start", type=int, default=99999999,
+                   help="step >= 此值开始把 anchor_scale 从 1.0 线性降到 --anchor-scale")
+    p.add_argument("--anchor-anneal-end", type=int, default=99999999,
+                   help="step >= 此值后 anchor_scale 固定为 --anchor-scale")
+    p.add_argument("--freeze-anchor", action="store_true",
+                   help="冻结 spatial_anchor（不再更新），仅作固定弱先验")
     p.add_argument("--warmup", type=int, default=500)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--log-every", type=int, default=20)
@@ -60,11 +64,21 @@ def lr_at(step: int, args) -> float:
     return args.lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
 
 
-def train_step(net, ren, gen, args, device, centroid_scale: float = 1.0):
+def anchor_scale_at(step: int, args) -> float:
+    """spatial_anchor 缩放调度：早期 1.0 打破对称，[start,end] 线性降到 floor。"""
+    if step <= args.anchor_anneal_start:
+        return 1.0
+    if step >= args.anchor_anneal_end:
+        return args.anchor_scale
+    frac = (step - args.anchor_anneal_start) / max(1, args.anchor_anneal_end - args.anchor_anneal_start)
+    return 1.0 + (args.anchor_scale - 1.0) * frac
+
+
+def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
     scene = gen.sample()
     img_gt = ren.render_scene(scene).detach()
     slots_gt, bg_gt = encode_scene(scene)
-    slots, aux, bg = net(img_gt.unsqueeze(0).to(device), centroid_scale=centroid_scale)
+    slots, aux, bg = net(img_gt.unsqueeze(0).to(device), anchor_scale=anchor_scale)
     slots = slots[0]
     bg_raw = bg[0]
     cls_ids = aux["cls"][0].detach().argmax(-1).cpu().numpy()
@@ -77,8 +91,7 @@ def train_step(net, ren, gen, args, device, centroid_scale: float = 1.0):
                                   w_cls=args.w_cls, w_ftype=args.w_ftype,
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
-                                  w_div=args.w_div, w_bbox=args.w_bbox,
-                                  w_cent=args.w_cent)
+                                  w_div=args.w_div, w_bbox=args.w_bbox)
     total.backward()
     return total.detach(), parts
 
@@ -118,21 +131,19 @@ def main():
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         ck = torch.load(args.resume, map_location=args.device)
-        # anchor-free 重构后 ckpt 可能含旧的 spatial_anchor；strict=False 容忍缺失/多余键
-        missing, unexpected = net.load_state_dict(ck["net"], strict=False)
-        if missing or unexpected:
-            print(f"[resume] partial load: missing={missing} unexpected={unexpected}")
-        try:
-            opt.load_state_dict(ck["opt"])
-        except Exception as e:
-            print(f"[train] optimizer state skipped (arch mismatch): {e} — fresh optimizer")
+        net.load_state_dict(ck["net"])
+        opt.load_state_dict(ck["opt"])
         start_step = int(ck["step"])
         gen._rng.bit_generator.state = ck["gen_rng"]
         print(f"[resume] {args.resume} @ step {start_step}")
 
+    if args.freeze_anchor:
+        net.spatial_anchor.requires_grad_(False)
+        print("[train] spatial_anchor frozen (fixed weak prior)")
+
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
-            "geom", "bbox", "bg", "div", "cent", "aux", "total"]
+            "geom", "bbox", "bg", "div", "aux", "total"]
     avg = {k: 0.0 for k in keys}
     t0 = time.time()
     n_log = 0
@@ -142,7 +153,8 @@ def main():
             g["lr"] = lr_at(step, args)
 
         opt.zero_grad(set_to_none=True)
-        total, parts = train_step(net, ren, gen, args, args.device, args.centroid_scale)
+        a_scale = anchor_scale_at(step, args)
+        total, parts = train_step(net, ren, gen, args, args.device, a_scale)
         gn = torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
         opt.step()
 
@@ -161,7 +173,7 @@ def main():
             print(f"[{step + 1}/{args.steps}] total={m['total']:.4f} "
                   f"render={m['render']:.4f} mae={m['mae']:.4f} "
                   f"geom={m['geom']:.4f} bbox={m['bbox']:.4f} "
-                  f"cent={m['cent']:.3f} gn={float(gn):.2f} "
+                  f"asc={a_scale:.2f} gn={float(gn):.2f} "
                   f"({sps:.2f} it/s)", flush=True)
             avg = {k: 0.0 for k in keys}
             n_log = 0

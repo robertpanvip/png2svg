@@ -251,6 +251,7 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - 诊断 mae 0.0758 < fix20k 0.0808，**但这是 +4k 步的副作用而非架构收益**（fix20k 多训 4k 应同等）；预测中心 `cx=0.193±0.218` 仍远离 GT `(0.499±0.155)`——grid-bias 未消失，反而退化成**中心坍缩**（比网格偏置更糟）。
 - match 88/119 略优于 fix20k 72/119，主要来自 `--w-bbox 0.5` 的 cx/cy L1 监督，**非质心贡献**。
 - **➜ anchor-free 注意力质心方案失败，不是突破口。** 它把网格偏置换成更糟的中心坍缩，对 mae / 定位 / 类坍缩都无改善。`runs/fix_af/last.pt` 不复用，最佳权重保留 `runs/fix20k/last.pt`。
+- **代码已还原（2026-09-09，commit 见下）**：`model/network.py` / `model/losses.py` / `train.py` 从 `a3b6f41`(anchor-free) 还原回其父提交 `6a42395` 的 `spatial_anchor` 网格锚点版本（anchor-free 代码保留在 `a3b6f41` 历史，未丢失）。还原原因：anchor-free 空间先验退化均匀、比网格更糟；且最佳权重 `fix20k/last.pt` 用 `spatial_anchor` 训练，还原后可干净 resume 做下一步类头修复。HANDOFF/诊断脚本改动保留。
 
 **战略重定（关键发现）：**
 - 空间先验之争（网格 vs 注意力质心）已证明两者都**不治本**。真正被"空间坍缩"叙事掩盖的 #1 瓶颈是 **类坍缩到 blob**——见 §5.2.7。
@@ -279,7 +280,7 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 model/targets.py    常量 + encode_scene/decode_scene（Scene↔张量）
 model/spec.py       slots_to_objs / predictions_to_targets / squash_*
 model/matching.py   （新增）O(n³) Hungarian slot↔GT 匹配解算器
-model/network.py    VectorNet + 注意力质心 anchor-free 空间先验（§5.2.6）
+model/network.py    VectorNet + spatial_anchor 网格空间先验（anchor-free 已还原，见 §5.2.6）
 model/losses.py     matched_auxiliary_losses（匹配版）+ spatial_diversity + cent_entropy 正则
 benchmarks/profile_step.py  单步分段计时 + 显存峰值（新增）
 benchmarks/diag_gate.py     门控诊断：valid 概率分布 / 裁剪对比（新增）

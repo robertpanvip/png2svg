@@ -213,15 +213,12 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_cls: float = 0.3, w_ftype: float = 0.3,
                    w_valid: float = 0.1, w_svalid: float = 0.1,
                    w_geom: float = 0.7, w_bg: float = 0.2,
-                   w_div: float = 0.05, w_bbox: float = 0.5,
-                   w_cent: float = 0.05) -> tuple:
+                   w_div: float = 0.05, w_bbox: float = 0.5) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
     a = matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt)
-    cent_ent = aux.get("cent_entropy", torch.zeros((), device=slots_raw.device))
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
-                 + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"]
-                 + w_cent * cent_ent)
+                 + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"])
     total = r["total"] + aux_total
     parts = {"mae": float(r["mae"].detach()),
              "ssim": float(r["ssim"].detach()),
@@ -234,7 +231,6 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
              "bbox": float(a["bbox"].detach()),
              "bg": float(a["bg"].detach()),
              "div": float(spatial_diversity(slots_raw).detach()),
-             "cent": float(cent_ent.detach()),
              "aux": float(aux_total.detach()),
              "total": float(total.detach())}
     return total, parts
