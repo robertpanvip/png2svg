@@ -641,3 +641,12 @@ compose  I_GROUP=264(4 one-hot) I_CLIP=268 I_CLIP_REF=269
 - **#27 接线**：`train.py` 删 soft-cls/cls-balance 遗留，接新签名；`evaluate.py` 同步。**新表示与旧 ckpt 头不兼容 → 从零训练**（--resume 严格加载不变）。
 - **冒烟**：50 步 GPU（256px, sub_px=1, no-ckpt）total 14.99→10.31、mae 0.69→0.37、**~3 it/s**（与旧表示持平，段扁平化无额外减速）、无 NaN。参数 5.03M。
 - **下一步**：from-scratch 长训 ~24k（≈2.2h），验收判据 = 对象匹配率/段类型分布多样性/mae vs 旧表示 0.069；diag 工具需按新契约重写（旧 diag_arch 依赖 I_CLS 已失效）。
+
+### 11.8 部署包骨架（2026-09-10 凌晨，随 #27 后落地）
+
+- `deploy/export_weights.py`：训练 ckpt → `deploy/weights/`（`net_fp32.pt` + `net_int8.pt` + `manifest.json`）。5.03M 参数：fp32 **19.21 MB**（<20MB 硬指标达标）；INT8 动态量化（Linear）16.72 MB（conv 未量化，尺寸收益有限，进一步压缩需 conv QAT）。
+- `deploy/predict.py`：独立 CPU 推理（torch+numpy+PIL）——net → predictions_to_targets → decode_scene → prune(可选) → serialize。`--bench` 跑 10 场景延迟基准。
+- **2k 步中间权重实测（CPU）**：net median 27.5ms / total median **86ms**、max 108ms（fp32），INT8 持平——**<1s 硬指标大幅达标**。INT8 无速度增益（conv 主导前向），定位为"压尺寸"选项。
+- 已知现象：2k 步权重预测对象 `fill=none` 且无 stroke → resvg 渲染不可见 → prune 全剪（`8→0`，空 SVG）。**非部署 bug，是训练早期未学会 ftype**；predict.py 已加空结果告警。最终权重（24k/40k）出包后需复测。
+- `benchmarks/infer.py` 已修至新接口（aux 头已并入 slot 向量）。
+- 待办：Rust/WASM 移植、conv QAT 全 INT8、最终权重复测延迟与剪枝收益。

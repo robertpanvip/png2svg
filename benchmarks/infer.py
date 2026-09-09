@@ -81,10 +81,9 @@ def main():
 
     img_in = rgba  # [4,H,W] tensor
     t0 = time.perf_counter()
-    slots, aux, bg = net(img_in.unsqueeze(0))
-    cls_ids = aux["cls"][0].argmax(-1).cpu().numpy()
-    ftype_ids = aux["ftype"][0].argmax(-1).cpu().numpy()
-    slots_np, bg_np = predictions_to_targets(slots[0], cls_ids, ftype_ids, bg[0])
+    with torch.no_grad():
+        slots, aux, bg = net(img_in.unsqueeze(0))
+        slots_np, bg_np = predictions_to_targets(slots[0], bg[0])
     scene_pred = decode_scene(slots_np, bg_np, canvas=args.size)
     t_net = time.perf_counter() - t0
 
