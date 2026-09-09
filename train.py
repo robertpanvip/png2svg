@@ -14,7 +14,7 @@ from dataset.generator import SceneGenerator
 from dataset.renderer import SoftSVGRenderer
 from model.losses import compute_losses
 from model.network import VectorNet
-from model.spec import slots_to_objs, slots_to_objs_soft, render_soft_objs
+from model.spec import slots_to_objs
 from model.targets import encode_scene
 
 
@@ -27,13 +27,9 @@ def parse_args():
                    help="disable per-object activation checkpointing in renderer")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--w-cls", type=float, default=0.3)
+    p.add_argument("--w-cls", type=float, default=0.3,
+                   help="段类型 CE 权重（每 slot 16 段 × {M,L,Q,C,A}）")
     p.add_argument("--w-ftype", type=float, default=0.3)
-    p.add_argument("--no-cls-balance", action="store_true",
-                   help="关闭类别平衡 CE（用均匀权重，便于对照消融）")
-    p.add_argument("--soft-cls", action="store_true",
-                   help="soft class mixing：每个 slot 渲染 5 种形状变体按 softmax(cls) 混合，"
-                        "使渲染对类可微，破解类别 mode collapse")
     p.add_argument("--w-valid", type=float, default=0.1)
     p.add_argument("--w-svalid", type=float, default=0.1)
     p.add_argument("--w-geom", type=float, default=0.7)
@@ -86,23 +82,14 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
     slots, aux, bg = net(img_gt.unsqueeze(0).to(device), anchor_scale=anchor_scale)
     slots = slots[0]
     bg_raw = bg[0]
-    cls_ids = aux["cls"][0].detach().argmax(-1).cpu().numpy()
-    ftype_ids = aux["ftype"][0].detach().argmax(-1).cpu().numpy()
-    if args.soft_cls:
-        groups, bg_s = slots_to_objs_soft(slots, ftype_ids, bg_raw,
-                                          args.size, args.pad_px)
-        img_pred = render_soft_objs(ren, groups, bg_s)
-    else:
-        objs, bg_s = slots_to_objs(slots, cls_ids, ftype_ids, bg_raw,
-                                   args.size, args.pad_px)
-        img_pred = ren._render_objs(objs, bg_s)
+    objs, bg_s = slots_to_objs(slots, bg_raw, args.size, args.pad_px)
+    img_pred = ren._render_objs(objs, bg_s)
     total, parts = compute_losses(img_pred, img_gt.to(device), slots, bg_raw,
-                                  aux, slots_gt, bg_gt,
+                                  slots_gt, bg_gt,
                                   w_cls=args.w_cls, w_ftype=args.w_ftype,
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
-                                  w_div=args.w_div, w_bbox=args.w_bbox,
-                                  cls_balance=not args.no_cls_balance)
+                                  w_div=args.w_div, w_bbox=args.w_bbox)
     total.backward()
     return total.detach(), parts
 

@@ -38,9 +38,7 @@ def evaluate_one(net, soft, scene, size):
 
     t0 = time.perf_counter()
     slots, aux, bg = net(img_in.unsqueeze(0))
-    cls_ids = aux["cls"][0].argmax(-1).cpu().numpy()
-    ftype_ids = aux["ftype"][0].argmax(-1).cpu().numpy()
-    slots_np, bg_np = predictions_to_targets(slots[0], cls_ids, ftype_ids, bg[0])
+    slots_np, bg_np = predictions_to_targets(slots[0], bg[0])
     t_net = time.perf_counter() - t0
 
     t0 = time.perf_counter()

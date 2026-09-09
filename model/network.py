@@ -6,7 +6,10 @@ import torch.nn.functional as F
 
 import math
 
-from model.targets import NUM_SLOTS, SLOT_DIM, BG_DIM, NUM_CLS, I_BBOX
+from model.targets import (
+    NUM_SLOTS, SLOT_DIM, BG_DIM, I_BBOX, I_SEG, I_FTYPE, I_SVALID, I_OPACITY,
+    I_GROUP, I_END, N_SEG, SEG_DIM,
+)
 
 
 class ConvBlock(nn.Module):
@@ -75,6 +78,16 @@ class DecoderLayer(nn.Module):
         return q
 
 
+# 分块头宽度（由 §11.6 契约索引推导，勿手写魔数）
+_GEOM_W = I_SEG                  # 7  (valid, bbox4, nseg, closed)
+_SEG_W = N_SEG * SEG_DIM         # 192
+_FILL_W = I_SVALID - I_FTYPE     # 34
+_STROKE_W = I_OPACITY - I_SVALID  # 17
+_FX_W = I_GROUP - I_OPACITY      # 14
+_COMP_W = I_END - I_GROUP        # 11
+assert _GEOM_W + _SEG_W + _FILL_W + _STROKE_W + _FX_W + _COMP_W == I_END
+
+
 class VectorNet(nn.Module):
     def __init__(self, in_ch: int = 4, d_model: int = 256, n_layers: int = 2,
                  n_heads: int = 4, ffn_dim: int = 512,
@@ -91,9 +104,19 @@ class VectorNet(nn.Module):
         self.final_norm = nn.LayerNorm(d_model)
         self.queries = nn.Parameter(torch.zeros(1, num_slots, d_model))
         nn.init.trunc_normal_(self.queries, std=0.02)
-        self.slot_head = nn.Linear(d_model, SLOT_DIM)
-        self.cls_head = nn.Linear(d_model, NUM_CLS)
-        self.ftype_head = nn.Linear(d_model, 4)
+        # 分块输出头（§11.6 契约）：段表用宽 MLP，其余块轻量。
+        self.geom_head = nn.Linear(d_model, _GEOM_W)
+        self.seg_head = nn.Sequential(
+            nn.Linear(d_model, 512), nn.SiLU(), nn.Linear(512, _SEG_W),
+        )
+        self.fill_head = nn.Sequential(
+            nn.Linear(d_model, 256), nn.SiLU(), nn.Linear(256, _FILL_W),
+        )
+        self.stroke_head = nn.Sequential(
+            nn.Linear(d_model, 128), nn.SiLU(), nn.Linear(128, _STROKE_W),
+        )
+        self.fx_head = nn.Linear(d_model, _FX_W)
+        self.comp_head = nn.Linear(d_model, _COMP_W)
         self.bg_head = nn.Linear(d_model, BG_DIM)
         # 空间锚点先验：强制每个 slot 偏向画布不同区域，打破 bbox 中心坍缩。
         # 加到 bbox 的 cx/cy 原始 logit 上（squash 用 _lin 把 logit 映射到 [-0.2,1.2]）。
@@ -124,12 +147,24 @@ class VectorNet(nn.Module):
         for layer in self.layers:
             q = layer(q, tokens)
         h = self.final_norm(q)
-        slots = self.slot_head(h)
+        # 按契约索引拼装 slot 张量；备用槽（I_END..SLOT_DIM）恒 0。
+        spare = SLOT_DIM - I_END
+        parts = [
+            self.geom_head(h),
+            self.seg_head(h),
+            self.fill_head(h),
+            self.stroke_head(h),
+            self.fx_head(h),
+            self.comp_head(h),
+        ]
+        slots = torch.cat(parts, dim=-1)
+        if spare > 0:
+            slots = torch.cat([slots, slots.new_zeros(b, self.num_slots, spare)], dim=-1)
         # 空间锚点先验按 anchor_scale 缩放：训练早期=1.0 打破对称坍缩，
         # 后期退火到 0 让对象学到任意连续位置（消除网格偏置）。
         slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
                                          + self.spatial_anchor * anchor_scale)
-        aux = {"cls": self.cls_head(h), "ftype": self.ftype_head(h)}
+        aux = {}  # 类/ftype 已并入 slot 向量（one-hot 块），辅助头随 #26 移除
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg
 

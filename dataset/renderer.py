@@ -9,7 +9,7 @@ import torch.utils.checkpoint
 from svg.scene_graph import (
     Scene, PathGeom, CircleGeom, EllipseGeom, RectGeom, PolygonGeom,
     FILL_NONE, FILL_SOLID, FILL_LINEAR, FILL_RADIAL,
-    CMD_M, CMD_L, CMD_Q, CMD_C, CMD_Z,
+    CMD_M, CMD_L, CMD_Q, CMD_C, CMD_A, CMD_Z,
 )
 
 _KAPPA = 0.5522847498
@@ -34,6 +34,51 @@ def _flatten_quadratic(p0, p1, p2, n):
     return (mt ** 2) * p0 + 2 * mt * t * p1 + (t ** 2) * p2
 
 
+def _flatten_arc(p0, p1, rx, ry, rot_deg, large, sweep, n):
+    """SVG 端点参数化弧 → n 个采样点（不含起点，含终点），numpy 版。"""
+    dx, dy = p0[0] - p1[0], p0[1] - p1[1]
+    if dx * dx + dy * dy < 1e-12 or rx < 1e-6 or ry < 1e-6:
+        t = np.linspace(0.0, 1.0, n + 1)[1:, None]
+        return p0[None, :] + t * (p1 - p0)[None, :]
+    phi = math.radians(float(rot_deg))
+    cos_p, sin_p = math.cos(phi), math.sin(phi)
+    x1p = cos_p * dx / 2 + sin_p * dy / 2
+    y1p = -sin_p * dx / 2 + cos_p * dy / 2
+    lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry)
+    if lam > 1.0:
+        s = math.sqrt(lam)
+        rx, ry = rx * s, ry * s
+    num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+    den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+    co = math.sqrt(max(num / max(den, 1e-24), 0.0))
+    if large == sweep:
+        co = -co
+    cxp = co * rx * y1p / ry
+    cyp = -co * ry * x1p / rx
+
+    def _ang(ux, uy, vx, vy):
+        # atan2(cross, dot)：与 torch 侧 _arc_points 保持一致（可微且无 acos 边界问题）
+        cross = ux * vy - uy * vx
+        dot = ux * vx + uy * vy
+        return math.atan2(cross, dot)
+
+    theta1 = _ang(1.0, 0.0, (x1p - cxp) / rx, (y1p - cyp) / ry)
+    dtheta = _ang((x1p - cxp) / rx, (y1p - cyp) / ry,
+                  (-x1p - cxp) / rx, (-y1p - cyp) / ry)
+    if not sweep and dtheta > 0:
+        dtheta -= 2 * math.pi
+    elif sweep and dtheta < 0:
+        dtheta += 2 * math.pi
+    mx, my = (p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2
+    ccx = mx + cos_p * cxp - sin_p * cyp
+    ccy = my + sin_p * cxp + cos_p * cyp
+    t = theta1 + dtheta * np.linspace(0.0, 1.0, n + 1)[1:]
+    ex = rx * np.cos(t)
+    ey = ry * np.sin(t)
+    return np.stack([ccx + cos_p * ex - sin_p * ey,
+                     ccy + sin_p * ex + cos_p * ey], axis=1)
+
+
 def _dedupe(pts: np.ndarray) -> np.ndarray:
     if len(pts) < 2:
         return pts
@@ -47,7 +92,16 @@ def _path_subpaths(path: PathGeom, samples_per_curve: int):
     subpaths = []
     cur = None
     for seg in path.segments:
-        pts = np.asarray(seg.pts, dtype=np.float64).reshape(-1, 2)
+        if seg.cmd == CMD_Z:
+            if cur is not None:
+                cur["closed"] = True
+                subpaths.append(cur)
+                cur = None
+            continue
+        if seg.cmd == CMD_A:
+            pts = list(seg.pts)  # [rx,ry,rot,la,sw,ex,ey] 特殊处理
+        else:
+            pts = np.asarray(seg.pts, dtype=np.float64).reshape(-1, 2)
         if seg.cmd == CMD_M:
             if cur is not None:
                 subpaths.append(cur)
@@ -60,6 +114,22 @@ def _path_subpaths(path: PathGeom, samples_per_curve: int):
                 p0 = np.asarray(cur["pts"][-1])
                 cur["pts"].extend(_flatten_quadratic(p0, pts[0], pts[1], samples_per_curve))
                 cur["pts"].append(pts[1])
+        elif seg.cmd == CMD_Q:
+            if cur is not None:
+                p0 = np.asarray(cur["pts"][-1])
+                cur["pts"].extend(_flatten_quadratic(p0, pts[0], pts[1], samples_per_curve))
+                cur["pts"].append(pts[1])
+        elif seg.cmd == CMD_A:
+            if cur is not None and len(pts) == 7:
+                p0 = np.asarray(cur["pts"][-1])
+                p1 = np.asarray(pts[5:7])
+                # rx/ry 为 uv 局部帧值 → 乘 bbox 边长映射到 abs
+                rx, ry = float(pts[0]) * path.bbox.w, float(pts[1]) * path.bbox.h
+                cur["pts"].extend(_flatten_arc(p0, p1, rx, ry,
+                                               float(pts[2]),
+                                               bool(pts[3] > 0.5),
+                                               bool(pts[4] > 0.5),
+                                               samples_per_curve))
         elif seg.cmd == CMD_C:
             if cur is not None:
                 p0 = np.asarray(cur["pts"][-1])

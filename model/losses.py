@@ -5,22 +5,19 @@ import torch
 import torch.nn.functional as F
 
 from model.targets import (
-    NUM_SLOTS, NUM_PTS, NUM_STOPS,
-    CLS_BLOB, CLS_POLYGON, CLS_STROKE,
-    FILL_SOLID_I, FILL_LINEAR_I, FILL_RADIAL_I,
-    I_VALID, I_CLS, I_CLOSED, I_BBOX, I_PTS, I_NPTS, I_FTYPE, I_FRGB, I_FALPHA,
-    I_GP0, I_GP1, I_GRAD, I_STOPS, I_NSTOPS, I_SVALID, I_SW, I_SRGB, I_SALPHA,
-    I_OPACITY, I_HOLE,
+    NUM_SLOTS, N_SEG, SEG_DIM, NUM_STOPS, NUM_DASH,
+    I_VALID, I_CLOSED, I_BBOX, I_NSEG, I_SEG,
+    I_FTYPE, I_FRGB, I_FALPHA, I_GP0, I_GP1, I_GRAD, I_STOPS, I_NSTOPS,
+    I_SVALID, I_SWIDTH, I_SRGB, I_SALPHA, I_SDASH, I_SCAP, I_SJOIN,
+    I_OPACITY, I_BLUR, I_SDX, I_SDY, I_SBLUR, I_ESRGB, I_ESALPHA,
+    I_GLOWR, I_EGRGB, I_EGALPHA,
+    I_GROUP, I_CLIP, I_CLIP_REF, I_MASK, I_MASK_REF, I_MASK_KIND,
 )
 from model.spec import squash_slots, squash_bg
 from model.matching import match_slots
 
-# 类别平衡权重：基于 dataset/generator.py shape_weights 逆频率，blob 归一到 1.0。
-# blob0.35 / polygon0.20 / ellipse0.15 / rect0.15 / stroke0.15
-# -> 1/0.35 : 1/0.20 : 1/0.15 : 1/0.15 : 1/0.15 = 1.0 : 1.75 : 2.33 : 2.33 : 2.33
-_CLS_PRIOR = (0.35, 0.20, 0.15, 0.15, 0.15)
-CLS_BAL_W = torch.tensor([1.0 / p for p in _CLS_PRIOR], dtype=torch.float32)
-CLS_BAL_W = CLS_BAL_W / CLS_BAL_W[0]
+# 每段类型占用的坐标槽数（M,L,Q,C,A）——GT 未用槽恒 0，损失按类型掩码
+_COORD_N = (2, 2, 4, 6, 7)
 
 
 def _ssim_mean(img_pred: torch.Tensor, img_gt: torch.Tensor, window: int = 7) -> torch.Tensor:
@@ -56,97 +53,149 @@ def _masked_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
 
 
 def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """对一组"已对齐"的 (pred, gt) slot 计算几何 masked-L1。
+    """对匹配对（全部 valid）计算新契约的全块监督。
 
-    约定：传入的 f / slots_raw / gt 均已按匹配对重排，且全部为 valid。
+    f / slots_raw / gt 均已按匹配对重排。
     """
     device = slots_raw.device
-    cls_gt = gt[:, I_CLS].long()
-    ft_gt = gt[:, I_FTYPE].long()
-    n_pts_gt = gt[:, I_NPTS]
-    n_stops_gt = gt[:, I_NSTOPS]
-    j_pts = torch.arange(NUM_PTS, device=device)
-    j_stops = torch.arange(NUM_STOPS, device=device)
+    B = gt.shape[0]
+    zero = slots_raw.sum() * 0.0
+    out = zero
 
-    m_valid = torch.ones(gt.shape[0], dtype=torch.bool, device=device)
-    m_pts_cls = m_valid & ((cls_gt == CLS_BLOB) | (cls_gt == CLS_POLYGON)
-                           | (cls_gt == CLS_STROKE))
-    m_pt = m_pts_cls.unsqueeze(1) & (j_pts.unsqueeze(0) < n_pts_gt.unsqueeze(1))
-    geom = _masked_l1(f["pts"], gt[:, I_PTS:I_PTS + 2 * NUM_PTS]
-                      .reshape(-1, NUM_PTS, 2), m_pt, slots_raw)
-    geom = geom + _masked_l1(f["n_soft"], n_pts_gt, m_pts_cls, slots_raw)
-    geom = geom + _masked_l1(f["closed"], gt[:, I_CLOSED], m_pts_cls, slots_raw)
-    geom = geom + _masked_l1(
+    nseg_gt = gt[:, I_NSEG]
+    closed_gt = gt[:, I_CLOSED]
+    j_seg = torch.arange(N_SEG, device=device)
+    m_seg = j_seg.unsqueeze(0) < nseg_gt.unsqueeze(1)          # [B,16]
+
+    # ---- 段表 ----
+    gt_seg = gt[:, I_SEG:I_SEG + N_SEG * SEG_DIM].reshape(B, N_SEG, SEG_DIM)
+    gt_type = gt_seg[..., :5].argmax(-1)                       # [B,16]
+    gt_coord = gt_seg[..., 5:]                                 # [B,16,7]
+    # 段类型 CE（w_cls 权重在调用侧施加）
+    logits = f["seg_type"]                                     # [B,16,5] raw
+    ce = F.cross_entropy(logits.reshape(-1, 5), gt_type.reshape(-1),
+                         reduction="none").reshape(B, N_SEG)
+    out = out + (ce * m_seg.float()).sum() / m_seg.float().sum().clamp(min=1.0)
+    # 段坐标 masked-L1：坐标槽占用数随类型而变
+    coord_n = torch.tensor(_COORD_N, device=device)[gt_type]   # [B,16]
+    col = torch.arange(7, device=device)
+    m_coord = m_seg.unsqueeze(-1) & (col.unsqueeze(0).unsqueeze(0) < coord_n.unsqueeze(-1))
+    out = out + _masked_l1(f["seg_c"], gt_coord, m_coord, slots_raw)
+    # nseg 软计数
+    out = out + _masked_l1(f["nseg"], nseg_gt, torch.ones(B, dtype=torch.bool, device=device),
+                           slots_raw)
+    out = out + _masked_l1(f["closed"], closed_gt,
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+
+    # ---- bbox / opacity ----
+    out = out + _masked_l1(
         torch.stack([f["cx"], f["cy"], f["w"], f["h"]], dim=1),
-        gt[:, I_BBOX:I_BBOX + 4], m_valid, slots_raw)
-    geom = geom + _masked_l1(f["opacity"], gt[:, I_OPACITY], m_valid, slots_raw)
+        gt[:, I_BBOX:I_BBOX + 4],
+        torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["opacity"], gt[:, I_OPACITY],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
 
-    m_solid = m_valid & (ft_gt == FILL_SOLID_I)
-    geom = geom + _masked_l1(f["rgb"], gt[:, I_FRGB:I_FRGB + 3], m_solid, slots_raw)
-    geom = geom + _masked_l1(f["fill_alpha"], gt[:, I_FALPHA], m_solid, slots_raw)
-
-    m_grad = m_valid & ((ft_gt == FILL_LINEAR_I) | (ft_gt == FILL_RADIAL_I))
+    # ---- fill ----
+    ft_gt = gt[:, I_FTYPE:I_FTYPE + 4].argmax(-1)              # [B]
+    m_solid = ft_gt == 1
+    out = out + _masked_l1(f["rgb"], gt[:, I_FRGB:I_FRGB + 3], m_solid, slots_raw)
+    out = out + _masked_l1(f["fill_alpha"], gt[:, I_FALPHA],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    m_grad = (ft_gt == 2) | (ft_gt == 3)
+    n_stops_gt = gt[:, I_NSTOPS]
+    j_stops = torch.arange(NUM_STOPS, device=device)
     m_stop = m_grad.unsqueeze(1) & (j_stops.unsqueeze(0) < n_stops_gt.unsqueeze(1))
-    geom = geom + _masked_l1(f["gp0"], gt[:, I_GP0:I_GP0 + 2], m_grad, slots_raw)
-    geom = geom + _masked_l1(f["gp1"], gt[:, I_GP1:I_GP1 + 2], m_grad, slots_raw)
-    geom = geom + _masked_l1(f["radius"], gt[:, I_GRAD], m_grad, slots_raw)
-    geom = geom + _masked_l1(f["stops"], gt[:, I_STOPS:I_STOPS + NUM_STOPS * 5]
-                             .reshape(-1, NUM_STOPS, 5), m_stop, slots_raw)
-    geom = geom + _masked_l1(2.0 + 2.0 * torch.sigmoid(slots_raw[:, I_NSTOPS]),
-                             n_stops_gt, m_grad, slots_raw)
+    out = out + _masked_l1(f["gp0"], gt[:, I_GP0:I_GP0 + 2], m_grad, slots_raw)
+    out = out + _masked_l1(f["gp1"], gt[:, I_GP1:I_GP1 + 2], m_grad, slots_raw)
+    out = out + _masked_l1(f["radius"], gt[:, I_GRAD], m_grad, slots_raw)
+    out = out + _masked_l1(f["stops"], gt[:, I_STOPS:I_STOPS + NUM_STOPS * 5]
+                           .reshape(B, NUM_STOPS, 5), m_stop, slots_raw)
+    out = out + _masked_l1(f["nstops"], n_stops_gt, m_grad, slots_raw)
 
-    m_stroke = m_valid & (gt[:, I_SVALID] > 0.5)
-    geom = geom + _masked_l1(f["sw"], gt[:, I_SW], m_stroke, slots_raw)
-    geom = geom + _masked_l1(f["stroke_rgb"], gt[:, I_SRGB:I_SRGB + 3],
-                             m_stroke, slots_raw)
-    geom = geom + _masked_l1(f["stroke_alpha"], gt[:, I_SALPHA], m_stroke, slots_raw)
+    # ---- stroke ----
+    m_stroke = gt[:, I_SVALID] > 0.5
+    out = out + _masked_l1(f["sw"], gt[:, I_SWIDTH], m_stroke, slots_raw)
+    out = out + _masked_l1(f["stroke_rgb"], gt[:, I_SRGB:I_SRGB + 3], m_stroke, slots_raw)
+    out = out + _masked_l1(f["stroke_alpha"], gt[:, I_SALPHA], m_stroke, slots_raw)
+    nd_gt = gt[:, I_SDASH + NUM_DASH]
+    j_dash = torch.arange(NUM_DASH, device=device)
+    m_dash = m_stroke.unsqueeze(1) & (j_dash.unsqueeze(0) < nd_gt.unsqueeze(1))
+    out = out + _masked_l1(f["dash"], gt[:, I_SDASH:I_SDASH + NUM_DASH]
+                           .reshape(B, NUM_DASH), m_dash, slots_raw)
+    out = out + _masked_l1(f["ndash"], nd_gt, m_stroke, slots_raw)
+    cap_gt = gt[:, I_SCAP:I_SCAP + 3].argmax(-1)
+    jn_gt = gt[:, I_SJOIN:I_SJOIN + 3].argmax(-1)
+    if bool(m_stroke.any()):
+        out = out + F.cross_entropy(f["cap"][m_stroke], cap_gt[m_stroke])
+        out = out + F.cross_entropy(f["join"][m_stroke], jn_gt[m_stroke])
 
-    m_hole = m_valid & (cls_gt == CLS_BLOB)
-    geom = geom + _masked_l1(f["hole"], gt[:, I_HOLE], m_hole, slots_raw)
-    return geom
+    # ---- effects（GT 无效果处恒 0，L1 推向 0）----
+    out = out + _masked_l1(f["blur"], gt[:, I_BLUR],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(torch.stack([f["sdx"], f["sdy"], f["sblur"]], dim=1),
+                           gt[:, I_SDX:I_SBLUR + 1],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["esrgb"], gt[:, I_ESRGB:I_ESRGB + 3],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["esalpha"], gt[:, I_ESALPHA],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["glowr"], gt[:, I_GLOWR],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["egrgb"], gt[:, I_EGRGB:I_EGRGB + 3],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    out = out + _masked_l1(f["egalpha"], gt[:, I_EGALPHA],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+
+    # ---- composition ----
+    out = out + _masked_l1(f["clip"], gt[:, I_CLIP],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    m_clip = gt[:, I_CLIP] > 0.5
+    out = out + _masked_l1(f["clip_ref"], gt[:, I_CLIP_REF], m_clip, slots_raw)
+    out = out + _masked_l1(f["mask"], gt[:, I_MASK],
+                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    m_mask = gt[:, I_MASK] > 0.5
+    out = out + _masked_l1(f["mask_ref"], gt[:, I_MASK_REF], m_mask, slots_raw)
+    out = out + _masked_l1(f["mask_kind"], gt[:, I_MASK_KIND], m_mask, slots_raw)
+    return out
 
 
-def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux: dict,
-                             slots_gt, bg_gt, cls_balance: bool = True) -> dict:
-    """带 Hungarian 匹配的辅助损失。
+def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
+                             slots_gt, bg_gt) -> dict:
+    """带 Hungarian 匹配的辅助损失（新契约）。
 
-    每一步把 8 个预测 slot 与 8 个 GT 对象做最优一一匹配，再在匹配对上算
-    cls/ftype/geom 监督；未匹配的预测 slot 被推向 invalid。这消除了"固定
-    slot 顺序对齐 GT"与"渲染损失置换不变"之间的冲突，是定位坍缩的核心修复。
+    代价 = bbox L1 + 段类型 NLL（几何签名）。匹配对上施加段表/属性块监督；
+    未匹配 slot 推向 invalid。aux 头已并入 slot 向量，参数仅为兼容保留。
     """
     device = slots_raw.device
     gt = torch.as_tensor(np.asarray(slots_gt), dtype=torch.float32, device=device)
     bg_t = torch.as_tensor(np.asarray(bg_gt), dtype=torch.float32, device=device)
     if bg_raw.dim() == 2:
         bg_raw = bg_raw[0]
-    cls_logits = aux["cls"] if aux["cls"].dim() == 3 else aux["cls"].unsqueeze(0)
-    ft_logits = aux["ftype"] if aux["ftype"].dim() == 3 else aux["ftype"].unsqueeze(0)
-    cls_logits = cls_logits[0]
-    ft_logits = ft_logits[0]
 
     f = squash_slots(slots_raw)
     gv = gt[:, I_VALID]
     valid_gt = gv > 0.5
-    cls_gt = gt[:, I_CLS].long()
-    ft_gt = gt[:, I_FTYPE].long()
 
-    # ---- 代价矩阵（仅 valid GT 参与匹配）----
-    pred_cx = f["cx"].detach(); pred_cy = f["cy"].detach()
-    pred_w = f["w"].detach(); pred_h = f["h"].detach()
-    pred_cls = torch.softmax(cls_logits, -1).detach()
+    pred_bbox = torch.stack([f["cx"], f["cy"], f["w"], f["h"]], dim=1).detach()
+    gt_seg_all = gt[:, I_SEG:I_SEG + N_SEG * SEG_DIM].reshape(NUM_SLOTS, N_SEG, SEG_DIM)
+    gt_type_all = gt_seg_all[..., :5].argmax(-1)               # [G,16]
+    nseg_all = gt[:, I_NSEG]
+
     n = NUM_SLOTS
-    cost = np.full((n, n), 1e6, dtype=np.float64)
-    for k in range(n):
+    with torch.no_grad():
+        logp = torch.log_softmax(f["seg_type"].detach(), -1)   # [K,16,5]
+        bbox_cost = (pred_bbox.unsqueeze(1) - gt[None, :, I_BBOX:I_BBOX + 4]) \
+            .abs().sum(-1).cpu().numpy()                       # [K,G]
+        jidx = torch.arange(N_SEG, device=device)
+        cost = np.full((n, n), 1e6, dtype=np.float64)
         for g in range(n):
             if not bool(valid_gt[g]):
                 continue
-            bbox_l1 = (abs(pred_cx[k] - gt[g, I_BBOX + 0])
-                       + abs(pred_cy[k] - gt[g, I_BBOX + 1])
-                       + abs(pred_w[k] - gt[g, I_BBOX + 2])
-                       + abs(pred_h[k] - gt[g, I_BBOX + 3])).item()
-            cls_nll = -(pred_cls[k, int(cls_gt[g])].clamp(1e-4, 1).log()).item()
-            cost[k, g] = bbox_l1 + cls_nll
-    assign = match_slots(cost)             # assign[g] = 预测 slot 下标 或 -1
+            m = jidx < nseg_all[g]
+            lp = logp[:, jidx, gt_type_all[g]]                 # [K,16]
+            type_nll = (-lp[:, m].mean(-1)).cpu().numpy()      # [K]
+            cost[:, g] = bbox_cost[:, g] + type_nll
+    assign = match_slots(cost)
 
     matched_pred = [k for k in assign if k >= 0]
     parts = {}
@@ -155,38 +204,37 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux:
         pred_idx = torch.tensor(matched_pred, device=device)
         gt_idx = torch.tensor([g for g in range(n) if assign[g] >= 0], device=device)
         valid_target[pred_idx] = 1.0
-        parts["cls"] = F.cross_entropy(cls_logits[pred_idx], cls_gt[gt_idx],
-                                      weight=CLS_BAL_W.to(device) if cls_balance else None)
-        parts["ftype"] = F.cross_entropy(ft_logits[pred_idx], ft_gt[gt_idx])
         f_g = {key: val[pred_idx] for key, val in f.items()}
         pred_raw_g = slots_raw[pred_idx]
         gt_g = gt[gt_idx]
-        geom = _geom_block(f_g, pred_raw_g, gt_g)
-        # cx/cy 专项 L1：匹配对上把中心拉向 GT 中心，直接提升 bbox 位置精度
-        # （geom 已含 cx/cy/w/h 联合 L1，此处额外加权中心以抑制网格偏置残留）
+        parts["geom"] = _geom_block(f_g, pred_raw_g, gt_g)
         parts["bbox"] = F.l1_loss(
             torch.stack([f_g["cx"], f_g["cy"]], dim=1),
             gt_g[:, I_BBOX:I_BBOX + 2])
+        # 段类型 CE 单独记账（w_cls 权重）
+        gt_seg = gt_g[:, I_SEG:I_SEG + N_SEG * SEG_DIM].reshape(-1, N_SEG, SEG_DIM)
+        gt_type = gt_seg[..., :5].argmax(-1)
+        nseg_g = gt_g[:, I_NSEG]
+        m_seg = torch.arange(N_SEG, device=device).unsqueeze(0) < nseg_g.unsqueeze(1)
+        ce = F.cross_entropy(f_g["seg_type"].reshape(-1, 5), gt_type.reshape(-1),
+                             reduction="none").reshape(-1, N_SEG)
+        parts["cls"] = (ce * m_seg.float()).sum() / m_seg.float().sum().clamp(min=1.0)
+        # ftype CE
+        ft_gt = gt_g[:, I_FTYPE:I_FTYPE + 4].argmax(-1)
+        parts["ftype"] = F.cross_entropy(f_g["ftype"], ft_gt)
+        # stroke valid BCE
+        parts["svalid"] = F.binary_cross_entropy(
+            f_g["stroke_valid"].clamp(1e-6, 1.0 - 1e-6), gt_g[:, I_SVALID])
     else:
-        parts["cls"] = slots_raw.sum() * 0.0
-        parts["ftype"] = slots_raw.sum() * 0.0
-        geom = slots_raw.sum() * 0.0
-        parts["bbox"] = slots_raw.sum() * 0.0
+        zero = slots_raw.sum() * 0.0
+        parts["geom"] = zero
+        parts["bbox"] = zero
+        parts["cls"] = zero
+        parts["ftype"] = zero
+        parts["svalid"] = zero
 
     parts["valid"] = F.binary_cross_entropy(
         f["valid"].clamp(1e-6, 1.0 - 1e-6), valid_target)
-
-    # stroke_valid BCE：在匹配对上比较
-    if matched_pred:
-        pred_idx = torch.tensor(matched_pred, device=device)
-        gt_idx = torch.tensor([g for g in range(n) if assign[g] >= 0], device=device)
-        parts["svalid"] = F.binary_cross_entropy(
-            f["stroke_valid"][pred_idx].clamp(1e-6, 1.0 - 1e-6),
-            gt[gt_idx, I_SVALID])
-    else:
-        parts["svalid"] = slots_raw.sum() * 0.0
-
-    parts["geom"] = geom
 
     bg_valid = torch.sigmoid(bg_raw[0]).clamp(1e-6, 1.0 - 1e-6)
     parts["bg"] = F.binary_cross_entropy(bg_valid, bg_t[0]) \
@@ -194,18 +242,8 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux:
     return parts
 
 
-def auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux: dict,
-                     slots_gt, bg_gt, cls_balance: bool = True) -> dict:
-    """兼容旧接口：直接转发到匹配版。"""
-    return matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt,
-                                    cls_balance=cls_balance)
-
-
 def spatial_diversity(slots_raw: torch.Tensor) -> torch.Tensor:
-    """惩罚所有活跃 slot 的中心过度集中（防定位坍缩的安全网）。
-
-    返回负空间方差——最小化它即最大化活跃 slot 中心分布。
-    """
+    """惩罚所有活跃 slot 的中心过度集中（防定位坍缩的安全网）。"""
     f = squash_slots(slots_raw)
     w = f["valid"]
     wsum = w.sum().clamp(min=1e-6)
@@ -216,7 +254,7 @@ def spatial_diversity(slots_raw: torch.Tensor) -> torch.Tensor:
 
 
 def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
-                   slots_raw: torch.Tensor, bg_raw: torch.Tensor, aux: dict,
+                   slots_raw: torch.Tensor, bg_raw: torch.Tensor,
                    slots_gt, bg_gt,
                    ssim_weight: float = 0.3,
                    w_cls: float = 0.3, w_ftype: float = 0.3,
@@ -225,8 +263,7 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_div: float = 0.05, w_bbox: float = 0.5,
                    cls_balance: bool = True) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
-    a = matched_auxiliary_losses(slots_raw, bg_raw, aux, slots_gt, bg_gt,
-                                cls_balance=cls_balance)
+    a = matched_auxiliary_losses(slots_raw, bg_raw, slots_gt, bg_gt)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
                  + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"])

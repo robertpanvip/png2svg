@@ -600,7 +600,44 @@ Q : [cx, cy, ex, ey, 0,0,0]            (控制 + 终点)
 C : [c1x,c1y, c2x,c2y, ex,ey, 0]
 A : [rx, ry, rot, largearc, sweep, ex, ey]
 ```
-**I_* 索引（待 #23 targets 实现时落定精确值）**：几何基 0–6；段表 7–198（16×12）；fill 199–231；stroke 232–248；effects 249–262；composition 263–273（SLOT_DIM=280）。
+**I_* 索引（#23 已落定，`model/targets.py` 为唯一权威）：**
+```
+几何基   I_VALID=0, I_BBOX=1..4(cx,cy,w,h), I_NSEG=5, I_CLOSED=6
+段表     I_SEG=7 .. 198   (16 段 × 12 = one-hot{M,L,Q,C,A}(5) + 坐标(7))
+fill     I_FTYPE=199(4 one-hot) I_FRGB=203(3) I_FALPHA=206 I_GP0=207(2)
+         I_GP1=209(2) I_GRAD=211 I_STOPS=212(4×5) I_NSTOPS=232        → 199..232 共 34
+stroke   I_SVALID=233 I_SWIDTH=234 I_SRGB=235(3) I_SALPHA=238
+         I_SDASH=239(4 值 + 数量槽@243) I_SCAP=244(3) I_SJOIN=247(3)   → 233..249 共 17
+effects  I_OPACITY=250 I_BLUR=251 I_SDX=252 I_SDY=253 I_SBLUR=254
+         I_ESRGB=255(3) I_ESALPHA=258 I_GLOWR=259 I_EGRGB=260(3)
+         I_EGALPHA=263                                                  → 250..263 共 14
+compose  I_GROUP=264(4 one-hot) I_CLIP=268 I_CLIP_REF=269
+         I_MASK=270 I_MASK_REF=271 I_MASK_KIND=272(lum=0/alpha=1)       → 264..274 共 11
+实际使用 275 维；275..279 备用。SLOT_DIM=280。
+```
+
+**#23 实现要点（与上稿契约的偏差，以此为准）：**
+- 段类型 one-hot **不含 Z**：Z 由 `I_CLOSED` 标志重建（closed=1 时每个 subpath 末尾/下一个 M 前补 Z），与 generator"subpath 全闭合或全开放"的产出约定一致。
+- **对象按场景原始顺序编码，不再按面积排序**——clip.ref/mask.ref 指向原始下标，且 z-order 有语义。
+- 坐标统一钳到 [0,1]（Catmull-Rom/quad 控制点可略超界）；`rot` 归一化 /360；A 段 rx/ry 为 uv 局部帧值。
+- `I_SDASH` 的第 5 槽（原 offset 预留）复用为 **dash 数量**（generator 不产 offset）。
+- 渐变 stops 上限 4（generator 可产 2..6，超出截断——P2 若需扩到 6，SLOT_DIM 相应 +10）。
+- **验证**：`benchmarks/check_targets.py` —— 60 场景 encode→decode→re-encode **逐位精确往返**（60/60 exact）、全部通过 `validate()` + resvg 渲染；死维度均为 one-hot 布局结构性死区（seg0 恒 M、seg15 罕达等），非缺陷。
 
 **渲染器契约（`spec.py`→`SoftSVGRenderer`）**：`slots_to_objs` 改为按段表重建 `PathGeom`（typed M/L/Q/C/A + compound），`Stroke` 带 dash/cap/join，`Effects` 接通 blur/shadow/glow（可微），`Group/Clip/Mask` 走合成通道。封闭形状（closed=1 且无显式 Z 段）自动补 Z。
 ```
+
+### 11.7 模型侧落地记录（2026-09-10，#23–#27 完成）
+
+- **#23 targets 重编码**：`model/targets.py` 全量重写至 §11.6 契约（280 维）。要点：段类型 one-hot 不含 Z（由 `I_CLOSED` 重建）；对象按场景原始顺序编码（保 z-order 与 clip/mask 引用）；坐标钳 [0,1]；rot/360；dash 数量复用 offset 槽。回归工具 `benchmarks/check_targets.py`：60 场景 encode→decode→re-encode 逐位精确 + validate + resvg 渲染全通过。
+- **#24 network**：删 `cls_head`/`ftype_head`（并入 slot 向量）；单一 linear 头拆为分块头（geom 7 / seg 192 MLP-512 / fill 34 / stroke 17 / fx 14 / comp 11），按契约索引拼装；`spatial_anchor` 保留（作用于 I_BBOX）。参数 4,699,441 → **5,027,832**（3–8M 预算内）。前向输出 (B,8,280) + bg；aux={}。
+- **#25 spec/渲染器**：
+  - `spec.py` 全量重写：`squash_slots` 按块可微映射（one-hot 块保留 raw logits 供 CE 与渲染 argmax）；`slots_to_objs(slots_raw, bg_raw, canvas, pad_px)` 段表→可微扁平化多边形（Q/C 贝塞尔采样、A 弧端点→中心参数化）；`targets_to_raw`（GT→raw，one-hot ±4 饱和 logits）；`predictions_to_targets` 硬化。
+  - `renderer.py`：`_path_subpaths` 支持 CMD_Q/CMD_A（numpy 扁平化，GT 直渲用）。
+  - **关键修复**：弧角度计算 acos→**atan2**——弧起点落在椭圆 θ=0°/180° 时 dot/ln 恰为 ±1，acos 导数发散 → 梯度 NaN（torch/numpy 两侧同步改）。
+  - **验证** `test`（GT→raw→可微渲染 vs SoftSVGRenderer 直渲 GT）：20 场景 mean mae **0.005**（max 0.025，曲线采样相位差），梯度全有限。
+  - **范围注记**：dash/cap/join、effects(blur/shadow/glow)、clip/mask 暂不在 soft 渲染路径（GT 与预测一致忽略，辅助损失监督；resvg 导出侧已支持）——P3b/P4 待训练管线稳定后补齐。
+- **#26 losses**：`_geom_block` 覆盖全契约块：段类型 CE（j<nseg 掩码）、段坐标 masked-L1（按类型占用槽数 `_COORD_N=(2,2,4,6,7)` 掩码）、nseg 软计数 L1、closed/bbox/opacity、fill(solid rgb/alpha + grad gp/radius/stops/nstops)、stroke(width/rgb/alpha/dash/ndash/cap CE/join CE)、effects 全 L1、composition BCE+ref L1。匹配代价 = bbox L1 + 段类型 NLL（向量化，无逐步 Python 循环）。`spatial_diversity` 保留。
+- **#27 接线**：`train.py` 删 soft-cls/cls-balance 遗留，接新签名；`evaluate.py` 同步。**新表示与旧 ckpt 头不兼容 → 从零训练**（--resume 严格加载不变）。
+- **冒烟**：50 步 GPU（256px, sub_px=1, no-ckpt）total 14.99→10.31、mae 0.69→0.37、**~3 it/s**（与旧表示持平，段扁平化无额外减速）、无 NaN。参数 5.03M。
+- **下一步**：from-scratch 长训 ~24k（≈2.2h），验收判据 = 对象匹配率/段类型分布多样性/mae vs 旧表示 0.069；diag 工具需按新契约重写（旧 diag_arch 依赖 I_CLS 已失效）。
