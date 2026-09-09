@@ -650,3 +650,17 @@ compose  I_GROUP=264(4 one-hot) I_CLIP=268 I_CLIP_REF=269
 - 已知现象：2k 步权重预测对象 `fill=none` 且无 stroke → resvg 渲染不可见 → prune 全剪（`8→0`，空 SVG）。**非部署 bug，是训练早期未学会 ftype**；predict.py 已加空结果告警。最终权重（24k/40k）出包后需复测。
 - `benchmarks/infer.py` 已修至新接口（aux 头已并入 slot 向量）。
 - 待办：Rust/WASM 移植、conv QAT 全 INT8、最终权重复测延迟与剪枝收益。
+
+### 11.9 新表示 24k 验收：PASS（2026-09-10 01:35，续训 40k 已启动）
+
+`diag_new.py`（30 场景 seed=777000，GPU）对 `runs/newrep/last.pt`：
+
+| 指标 | 实测 | 判据/旧基线 |
+|---|---|---|
+| mae_mean | **0.0541** | 判据 ≤0.085；旧表示 0.069（提升 22%） |
+| 对象匹配率 | **1.000（132/132）** | 判据 ≥0.5；旧总匹配率 0.32 |
+| 预测段类型 | C:485 / L:109 / A:60 / M:132 | 判据 ≥3 种非 M；旧 240/240 全 blob |
+| CPU total p95 | 39.8ms（under_1s=1.0） | <1s |
+| oracle_seg / nseg_gap | +0.0016 / −1.78 | 段数偏少 1.8 段 |
+
+**判定：PASS，三项全过。blob 万能类坍缩在结构上消灭生效**——匹配满分、类型多样化、mae 显著优于旧表示。短板：Q 段预测为 0（被 C 吸收，渲染无损）、L 准确率 0.26、欠分段 1.8 段。40k 续训后台运行中（`runs/newrep_train2.log`，预计 ~02:50），06:40 晨报自动化做 40k 终诊 + 部署复测。验收详情：`runs/newrep/ACCEPTANCE_24K.md`；诊断数据：`runs/diag_new_24k.json`、`runs/eval_newrep24k.json`。

@@ -1,0 +1,28 @@
+{
+  "mae_mean": 0.054136433630871277,
+  "match_rate": 1.0,
+  "pred_seg_types": {
+    "M": 132,
+    "C": 485,
+    "L": 109,
+    "A": 60
+  },
+  "gt_seg_types": {
+    "M": 145,
+    "A": 87,
+    "Q": 68,
+    "L": 180,
+    "C": 306
+  },
+  "seg_type_acc": {
+    "M": 0.91,
+    "A": 0.575,
+    "Q": 0.0,
+    "L": 0.261,
+    "C": 0.859
+  },
+  "nseg_gap_mean": -1.7803030303030303,
+  "oracle_seg": 0.0016,
+  "num_scenes": 30,
+  "ckpt": "runs/newrep/last.pt"
+}
