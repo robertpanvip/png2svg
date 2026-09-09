@@ -1,0 +1,38 @@
+{
+  "ckpt": "runs/fix_af/last.pt",
+  "suite": "mixed",
+  "num_scenes": 30,
+  "mae": {
+    "baseline": 0.07583412577708562,
+    "oracle_cls": 0.07416566616545121,
+    "oracle_bbox": 0.07054912031938633,
+    "oracle_cls_bbox": 0.06330162342637777,
+    "oracle_valid": 0.07583412577708562
+  },
+  "mae_gain_vs_baseline": {
+    "oracle_cls": 0.001668459611634407,
+    "oracle_bbox": 0.0052850054576992905,
+    "oracle_cls_bbox": 0.012532502350707853,
+    "oracle_valid": 0.0
+  },
+  "cls_pred_hist": {
+    "blob": 240,
+    "polygon": 0,
+    "ellipse": 0,
+    "rect": 0,
+    "stroke": 0
+  },
+  "cls_gt_hist": {
+    "blob": 52,
+    "polygon": 26,
+    "ellipse": 21,
+    "rect": 8,
+    "stroke": 12
+  },
+  "cls_entropy_mean": 0.9915079445888598,
+  "cls_max_entropy": 1.6094379124341003,
+  "bbox_pred": "pred: n=240 cx=0.193±0.218 cy=0.218±0.190 w=0.134±0.132 h=0.137±0.136",
+  "bbox_gt": "gt: n=119 cx=0.499±0.155 cy=0.480±0.176 w=0.336±0.130 h=0.314±0.134",
+  "matched_pairs": 88,
+  "gt_objects": 119
+}

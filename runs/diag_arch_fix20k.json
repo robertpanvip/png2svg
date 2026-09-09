@@ -3,17 +3,17 @@
   "suite": "mixed",
   "num_scenes": 30,
   "mae": {
-    "baseline": 0.07691587327669064,
-    "oracle_cls": 0.07518381203214328,
-    "oracle_bbox": 0.07053461329390605,
-    "oracle_cls_bbox": 0.06446959873040517,
-    "oracle_valid": 0.07641328200697899
+    "baseline": 0.08083502426743508,
+    "oracle_cls": 0.0814871896058321,
+    "oracle_bbox": 0.0739037257929643,
+    "oracle_cls_bbox": 0.06962541379034519,
+    "oracle_valid": 0.07900422538320223
   },
   "mae_gain_vs_baseline": {
-    "oracle_cls": 0.0017320612445473615,
-    "oracle_bbox": 0.00638125998278459,
-    "oracle_cls_bbox": 0.012446274546285468,
-    "oracle_valid": 0.0005025912697116525
+    "oracle_cls": -0.000652165338397015,
+    "oracle_bbox": 0.0069312984744707845,
+    "oracle_cls_bbox": 0.01120961047708989,
+    "oracle_valid": 0.0018307988842328482
   },
   "cls_pred_hist": {
     "blob": 240,
@@ -29,10 +29,10 @@
     "rect": 8,
     "stroke": 12
   },
-  "cls_entropy_mean": 0.9950731406609218,
+  "cls_entropy_mean": 0.9950731355696917,
   "cls_max_entropy": 1.6094379124341003,
-  "bbox_pred": "pred: n=240 cx=0.230±0.231 cy=0.209±0.230 w=0.145±0.126 h=0.150±0.133",
+  "bbox_pred": "pred: n=240 cx=0.232±0.259 cy=0.175±0.088 w=0.145±0.126 h=0.150±0.133",
   "bbox_gt": "gt: n=119 cx=0.499±0.155 cy=0.480±0.176 w=0.336±0.130 h=0.314±0.134",
-  "matched_pairs": 90,
+  "matched_pairs": 72,
   "gt_objects": 119
 }

@@ -19,9 +19,9 @@
     -0.024023307487368584
   ],
   "cls_head_bias_std": 0.03406596556305885,
-  "forward_slot_out_cos_sim_mean": 0.9074422975613796,
-  "forward_slot_out_cos_sim_max": 0.977746131164687,
+  "forward_slot_out_cos_sim_mean": 0.9189122869718492,
+  "forward_slot_out_cos_sim_max": 0.9827746206096241,
   "per_scene_active_slots_mean": 8.0,
-  "bbox_center_variance_mean": 0.04778345320373774,
+  "bbox_center_variance_mean": 0.03893974302336574,
   "num_scenes": 20
 }

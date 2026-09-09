@@ -227,7 +227,7 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 2. **真实图片泛化**：拿真实图标 PNG 跑 `benchmarks/infer.py`，验证泛化（训练分布=SceneGenerator 合成）。
 3. 训练侧：暂停，边际收益已负。
 
-### 5.2.6 anchor-free 架构大改：注意力质心空间先验（用户授权，运行中）
+### 5.2.6 anchor-free 架构大改：注意力质心空间先验（已完成，结论：**失败**）
 
 > 根因（§5.2.5 结论）：bbox 中心精度（oracle_bbox +6.4%）是硬网格锚点的伴生代价——网格先验同时是 slot 消歧的解药与 grid-bias 的病根，调参绕不开。真正突破 = 去掉硬编码网格，让空间先验从图像本身来。
 > 设计（用户选"注意力质心"方案）：删 `spatial_anchor`，改用 cross-attn 注意力权重算出的**质心**作为数据驱动空间先验（模型看哪、中心就在哪），bbox 中心 L1 梯度反传回注意力使其聚焦；加注意力熵正则（`w_cent`）鼓励每个 slot 看向紧凑区域，防质心扩散回中心。
@@ -246,9 +246,33 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - 正式验证：`--resume runs/fix20k/last.pt --steps 24000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --centroid-scale 1.0 --w-cent 0.15 --w-bbox 0.5 --out runs/fix_af`（新增 4k 步，约 25min）。
 - 判定：跑 `diag_query`/`diag_arch`，看 (a) `cent` 熵从 5.54 明显下降（注意力聚焦）；(b) 中心方差 >0.01 且**中心分布不再钉在 (0.23,0.21) 网格点**（grid-bias 消失）；(c) oracle_bbox 从 +6.4% 回落、(d) 诊断 mae < 0.0769。
 
-**预期与风险：**
-- 若注意力聚焦 + grid-bias 消失 → anchor-free 成功，继续长训到 ~32k 巩固，fix_af 成新最佳。
-- 若 `cent` 仍 ~5.54、中心回退到 (0.5,0.5) → cross-attn 在 4k 内学不会定位，需**从随机初始化从头训**（DETR 式，更长步数）或加大 `w_cent`/加每层辅助损失。fix20k 仍保留为最佳。
+**结论（2026-09-09，task zwkWj3 完成 + 同口径诊断）：**
+- `cent` 全程卡 **5.544（=ln256 最大熵）** → cross-attn 权重在 256-token 特征图上**完全均匀**，质心 = 图像几何中心 (0.5,0.5)，对 8 个 slot **零空间区分力**。`w_cent=0.15` 不起作用：注意力已到最大熵，梯度无法使其聚焦（或损失地形偏好均匀——因为其余分支也坍缩）。
+- 诊断 mae 0.0758 < fix20k 0.0808，**但这是 +4k 步的副作用而非架构收益**（fix20k 多训 4k 应同等）；预测中心 `cx=0.193±0.218` 仍远离 GT `(0.499±0.155)`——grid-bias 未消失，反而退化成**中心坍缩**（比网格偏置更糟）。
+- match 88/119 略优于 fix20k 72/119，主要来自 `--w-bbox 0.5` 的 cx/cy L1 监督，**非质心贡献**。
+- **➜ anchor-free 注意力质心方案失败，不是突破口。** 它把网格偏置换成更糟的中心坍缩，对 mae / 定位 / 类坍缩都无改善。`runs/fix_af/last.pt` 不复用，最佳权重保留 `runs/fix20k/last.pt`。
+
+**战略重定（关键发现）：**
+- 空间先验之争（网格 vs 注意力质心）已证明两者都**不治本**。真正被"空间坍缩"叙事掩盖的 #1 瓶颈是 **类坍缩到 blob**——见 §5.2.7。
+
+### 5.2.7 新瓶颈：类别 mode collapse（blob 垄断）— 下一突破方向
+
+> 诊断铁证（fix20k 与 fix_af **同口径** diag_arch，30 场景 seed=777000）：
+> - **预测分布**：240/240 slot 全为 `blob`；**GT 分布**：blob 52 / polygon 26 / ellipse 21 / rect 8 / stroke 12（5 类）。
+> - cls logits 熵 `0.99 / 1.61`（未数学全坍，但 argmax 恒为 blob）。
+> - `oracle_cls`：fix20k **-0.8%**、fix_af **+2.2%** → 给真类标签几乎无益。
+> - `oracle_cls_bbox`：fix20k **+13.9%**、fix_af **+16.5%**（天花板，说明类+位置若都对还能降 14–16% mae，但模型学不到类）。
+>
+> **根因（推测，待验证）：**
+> 1. `dataset/renderer.py` 中 `detach().argmax()` 切断了 cls 头经渲染损失的梯度 → 类头只靠弱辅助 CE，无渲染侧激励区分 blob/ellipse/rect（256px 下外观相似）。
+> 2. 类别不平衡：blob 占 GT 44%，模型直接塌到多数类；辅助 CE 权重 `w_cls` 过低。
+> 3. 类头容量/特征不足以区分形状（decoder 最后层特征对类不敏感）。
+>
+> **下一步实验（优先级高于任何空间改动）：**
+> 1. 修 `detach().argmax()`：让 cls 接收渲染梯度（或软化 argmax 用 differentiable top-k / soft argmax），使 blob vs ellipse 在渲染上可区分。
+> 2. 类别平衡 CE：按逆频率重加权（polygon/ellipse/rect/stroke 全为稀有类，需大幅提权）。
+> 3. 提高 `w_cls`（当前偏低）→ 观察 cls 熵与 oracle_cls 是否上升。
+> 4. **验证判据**：若 `oracle_cls` 从 +2.2% 升到 >10% 且预测分布出现非 blob 类，说明类头有救、空间+类双修可推进；若仍 100% blob，则类头/特征结构需重构（如类无关几何 + 类特定外观解耦）。
 
 ## 6. 关键文件索引
 ```

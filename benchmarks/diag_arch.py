@@ -77,6 +77,18 @@ def render_slots(slots_np: np.ndarray, bg_np: np.ndarray, size: int):
     return to_tensor_rgba(render_scene_resvg(scene, size, size))
 
 
+def _load_net(ckpt: str) -> "VectorNet":
+    """容错加载：跨架构 checkpoint（如含已删除的 spatial_anchor）也能比对。"""
+    net = VectorNet()
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    sd = ck["net"]
+    own = net.state_dict()
+    sd = {k: v for k, v in sd.items() if k in own}
+    net.load_state_dict(sd, strict=False)
+    net.eval()
+    return net
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
@@ -86,10 +98,7 @@ def main() -> int:
     p.add_argument("--out", default="runs/diag_arch.json")
     args = p.parse_args()
 
-    net = VectorNet()
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    net.load_state_dict(ck["net"])
-    net.eval()
+    net = _load_net(args.ckpt)
 
     cfg = GeneratorConfig(**SUITES[args.suite])
     gen = SceneGenerator(cfg, 777000)

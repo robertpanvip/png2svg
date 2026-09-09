@@ -31,6 +31,18 @@ def _cos_mat(x: torch.Tensor) -> np.ndarray:
     return (x @ x.t()).cpu().numpy()
 
 
+def _load_net(ckpt: str) -> "VectorNet":
+    """容错加载：跨架构 checkpoint（如含已删除的 spatial_anchor）也能比对。"""
+    net = VectorNet()
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    sd = ck["net"]
+    own = net.state_dict()
+    sd = {k: v for k, v in sd.items() if k in own}
+    net.load_state_dict(sd, strict=False)
+    net.eval()
+    return net
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
@@ -40,10 +52,7 @@ def main() -> int:
     p.add_argument("--out", default="runs/diag_query.json")
     args = p.parse_args()
 
-    net = VectorNet()
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    net.load_state_dict(ck["net"])
-    net.eval()
+    net = _load_net(args.ckpt)
 
     # --- 静态权重检查 ---
     with torch.no_grad():
