@@ -171,12 +171,27 @@ python3 evaluate.py --ckpt runs/gpu/last.pt --num 20 --size 256 --out runs/eval_
 - `model/network.py`：`forward(img, anchor_scale=1.0)`，`slots[...,I_BBOX:I_BBOX+2] += spatial_anchor * anchor_scale`（缩放而非硬加）。
 - `train.py`：新增 `--anchor-scale`（floor）、`--anchor-anneal-start/end`、`--freeze-anchor`；`anchor_scale_at(step)` 线性调度；日志加 `asc=` 监控。
 
-**运行（2026-09-09）：**
+**运行（2026-09-09，已完成 task hqBwtH）：**
 - 命令：`python -u train.py --resume runs/fix20k/last.pt --steps 32000 --size 256 --sub-px 1 --no-grad-checkpoint --device cuda --anchor-scale 0.0 --anchor-anneal-start 20000 --anchor-anneal-end 28000 --freeze-anchor --out runs/fix_anchor`
-- 状态：**运行中**（task hqBwtH，约 65min）；退火窗口 20k→28k，之后 asc=0 释放 4k 步。
-- 50 步冒烟已验证：`asc` 1.00→0.00 平滑、无 NaN/爆炸、gn 正常；asc=0 后 50 步未塌缩（w_div 兜底）。
+- 收尾：step 32000，train mae=0.0721，geom=5.18，asc=0.00，无报错。
 
-**验证（待训练完）：** 重跑 `diag_query`/`diag_arch`，看 (a) 中心方差仍 >0.01（坍缩未回退）、(b) oracle_bbox 增益回落到 ~1–2%、(c) mae < 0.0733。若中心方差回退到 ~0 则改为 floor=0.2 重跑（保留弱先验防塌缩）。
+**验证结果（同 30 场景 seed=777000，与 fix20k 直接可比）：**
+| 指标 | fix20k（锚点固定） | fix_anchor（释放到 0） | 判定 |
+|------|--------------------|------------------------|------|
+| 诊断 baseline mae | **0.0769** | 0.0814（+5.8% 更差） | ❌ 释放后反而变差 |
+| oracle_bbox 增益 | +6.4% | +10.6% | ❌ bbox 更偏离 GT |
+| 匹配 GT 对象 | 90/119 | 95/119 | ✅ 多匹配 5 个 |
+| bbox 中心均值 | (0.23, 0.21) | (0.25, 0.29) | ❌ GT 应 (0.5,0.5)，飘向左上 |
+| 中心方差均值 | 0.0478 | 0.0883 | ✅ 更分散（坍缩确未回退） |
+| cls 分布 | 100% blob | 100% blob | ➖ 仍 mode collapse |
+
+**结论（数据驱动，已证伪"完全释放锚点"假设）：**
+- **完全释放锚点（asc→0）是次优的**：对象更分散、匹配更多，但诊断 mae 反升 5.8%、bbox 偏离 GT 更大。根因：硬网格锚点提供了"大概对"的位置先验，撤掉后网络缺乏位置归纳偏置，把对象飘到**偏左上的错误分布**（cx=0.25/cy=0.29，而 GT 均匀 0.5/0.5）。
+- `train mae` 的"改善"（0.0721<0.0746）只是训练分布过拟合假象；固定诊断集上 fix_anchor 更差。
+- **当前最佳可用 ckpt = `runs/fix20k/last.pt`**（锚点固定，诊断 mae 0.0769 优于 fix_anchor 0.0814）。
+- 修复带来的真实收益已坐实：原 20k 未修复 oracle_bbox +11.3% → fix20k +6.4%（bbox 误差减半），中心方差 0.000026→0.0478（坍缩彻底打破）。
+
+**下一步（待定，未执行）：** 锚点不应降到 0，应保留**弱先验 floor≈0.3**（`--anchor-scale 0.3` 不退火，或退火到 floor 而非 0）。此外 oracle 显示 bbox 中心仍有 +6.4% 空间，建议**对匹配对象加 cx/cy 专项 L1 监督**（让网络在锚点附近精修到 GT 中心）比继续堆步数更有效。阶段优先级：弱锚点重训 > bbox 中心专项监督 > 类别 mode collapse（cls 影响仅 +1.7%，最低优先）。
 
 ## 6. 关键文件索引
 ```
