@@ -678,3 +678,42 @@ compose  I_GROUP=264(4 one-hot) I_CLIP=268 I_CLIP_REF=269
 **prune 升级**：`prune_scene_greedy`（贪心迭代，逐层剥冗余副本；O(N²) 渲染 N=8 时 ~0.3-0.7s）替代独立消融成为 deploy 默认。当前权重剪后为空是**正确行为**（对象无不可替代贡献）。
 
 部署包定稿：fp32 19.21MB / INT8 16.72MB / CPU net 19-27ms。晨报：`runs/newrep/MORNING_REPORT.md`。
+
+### 11.11 P-Appearance 深挖（2026-09-10 深夜）：外观瓶颈完整定案
+
+用户拍板 P-Appearance 后的一整轮系统性排查。**结论先行：颜色学不会不是损失/监督问题，而是"从图像提取逐对象颜色"在当前数据分布+架构下信息不足，灰色均值 (0.37) 是网络在可提取特征下的理性（近贝叶斯最优）选择。** 三条架构补救全部实测证伪，下一步须换路线（见文末选项）。
+
+**已证伪的假设链（全部有实验数据）：**
+
+| # | 假设 | 实验 | 结果 |
+|---|---|---|---|
+| 1 | 颜色缺直接监督 | `_appearance_block` 拆出（w_fill=2.0），5k 微调 | app 损失 0.65 纹丝不动 ❌ |
+| 2 | 优化/梯度断裂 | 单场景过拟合 600 步（`overfit_one.py`） | app 0.61→0.036 ✓ 通路健康 |
+| 3 | h 缺颜色→ROI bbox 统计拼头 | grid16/32 raw 均值+std 拼进 fill/stroke 头，10k 微调 | app 平坦 ❌（bbox 均值 corr 仅 0.15-0.27）|
+| 4 | HR 分支（stride-4，32×32 token + slot cross-attn） | `newrep_hr` 10k 微调 | app 平坦 ❌；hrf 线性探针**带切分** TEST R²<0（不带切分 R²=0.4 是 65 维/79 样本记忆假象）|
+| 5 | attention 学不会"往哪看"→bbox 中心正弦位置提示进 query | head-only 在线实验 | 仍震荡 ❌ |
+| 6 | 单样本梯度噪声→梯度累积×8 | head-only 在线 | 仍震荡 ❌ |
+| 7 | 预测掩码池化（predict-then-read） | 零训练探针 | **预测覆盖弥散（cov max 0.22，无像素>0.5）**，池化 corr≈0 ❌ |
+
+**信息上限实测（60 场景，无拟合统计）：**
+- GT bbox 均值（全分辨率）corr 0.27 / erode40 0.42 / 中心高斯 0.35 —— bbox 类池化天花板 ~0.42，L1 0.22 vs 灰 0.26（收益太小）
+- 路径点采样 corr ~0.1（采到的是**白/黑描边**——generator 是"彩填充+白/黑描边"贴纸风）
+- **oracle（GT 对象层掩码 α>0.5）内部池化 corr 0.62-0.67** ← 颜色信息只在这里
+- 对象中位 bbox 仅画布 8.7%，逐对象层覆盖 0.3-3%——细小对象+描边+遮挡+半透明让颜色在 token/池化粒度被稀释
+- 主干 ConvBlock 的 **GroupNorm 抹掉绝对颜色尺度**：HR 特征只剩相对模式，颜色映射跨场景不可泛化（test R²<0 的直接原因）
+
+**匹配对颜色实测（`matched_fill_check.py`）：所有 slot 输出同一数据集均值灰 ~0.37，与 GT（蓝/品红/黄…）无关；ftype 还把 GT-none 的 slot 预测成 solid（灰填充污染背景）。**
+
+**已落地的代码资产（已提交）：**
+- `losses.py`：`_appearance_block` 独立（w_fill，默认 2.0）；geom 块 retain 渐变几何/描边宽度/dash
+- `network.py`：HR 颜色分支（hr_encoder stride-4→32×32、slot cross-attn 含 raw 颜色 token 直通 + bbox 中心位置提示 query + 确定性 cf_raw 高斯池化）——fill/stroke 头 in=324；参数 5.16M/19.7MB fp32、CPU fwd 28ms
+- `train.py`：--w-fill；appearance 日志键；**resume 容错**（形状不匹配键重初始化 + 跳过旧 opt 状态，否则 Adam exp_avg 形状崩）
+- `benchmarks/`：probe_appearance（梯度探针）、matched_fill_check（--ckpt 容错加载）、overfit_one、overfit_head_only（fixed/online × accum）、probe_hrf、probe_maskpool
+
+**下一步选项（按推荐排序，用户拍板）：**
+- **A（推荐 P0）：generator 侧减压**——对象更大（bbox 面积 ≥15%）、更少遮挡、描边更细、closed-solid 占比更高，让颜色信息可提取后重训颜色通路。任务合法性：真实图标的颜色区远大于当前 generator 的细碎对象；这是把训练分布拉回可学区间，不是作弊。
+- B：**覆盖锐化**——SoftSVGRenderer gamma/zeta 调小（cov max 0.22→接近 0/1），形状变脆利后掩码池化/SSIM 都受益；可与 A 组合。
+- C：**颜色蒸馏**——train 时用 GT 掩码池化颜色（corr 0.65）作为 dense 目标，蒸馏进 color-readout 头（每 slot 每步都有监督，不依赖匹配+fill 最终输出）。风险：head 仍需学会定位对象内部，未必跳出同一陷阱。
+- D：接受吸收——Q 段式处理：颜色短期内以渲染 MAE 缓慢爬坡，优先推进 P3b/P4（dash/effects）。
+
+**注意**：新架构（HR 分支）权重与 `runs/newrep/last.pt` 不兼容层已自动重初始化；`runs/newrep_fill`（w_fill 微调 5k）与 `runs/newrep_hr`（HR 10k）两个 ckpt 的 mae 与 40k 基本持平（0.046-0.053），几何无退化，可作 A 路线重训起点。

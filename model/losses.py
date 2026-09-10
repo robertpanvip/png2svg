@@ -52,7 +52,46 @@ def _masked_l1(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor,
     return diff[mask].mean()
 
 
-def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+def _appearance_block(f: dict, gt: torch.Tensor) -> torch.Tensor:
+    """外观直接监督（匹配对）：fill 颜色/alpha + 描边颜色/alpha + opacity。
+
+    P-Appearance（HANDOFF §11.10）：颜色通路原先埋在几何块均值里
+    （约 3/50 的梯度占比），40k 步仍全员卡在数据集均值灰——梯度在
+    共享权重上互相抵消。拆出独立权重 w_fill 高强度监督。
+    f / gt 均已按匹配对重排。
+    """
+    device = gt.device
+    B = gt.shape[0]
+    zero = gt.sum() * 0.0
+    out = zero
+
+    ft_gt = gt[:, I_FTYPE:I_FTYPE + 4].argmax(-1)              # [B]
+    m_solid = ft_gt == 1
+    out = out + _masked_l1(f["rgb"], gt[:, I_FRGB:I_FRGB + 3], m_solid, zero)
+    out = out + _masked_l1(f["fill_alpha"], gt[:, I_FALPHA],
+                           torch.ones(B, dtype=torch.bool, device=device), zero)
+    m_grad = (ft_gt == 2) | (ft_gt == 3)
+    n_stops_gt = gt[:, I_NSTOPS]
+    j_stops = torch.arange(NUM_STOPS, device=device)
+    m_stop = m_grad.unsqueeze(1) & (j_stops.unsqueeze(0) < n_stops_gt.unsqueeze(1))
+    stops = f["stops"]                                          # [B, NUM_STOPS, 5]
+    gt_stops = gt[:, I_STOPS:I_STOPS + NUM_STOPS * 5].reshape(B, NUM_STOPS, 5)
+    # stops rgb/alpha（位置 pos 属几何，留在 geom 块）
+    out = out + _masked_l1(stops[..., 1:5], gt_stops[..., 1:5], m_stop, zero)
+
+    # 描边颜色/alpha
+    m_stroke = gt[:, I_SVALID] > 0.5
+    out = out + _masked_l1(f["stroke_rgb"], gt[:, I_SRGB:I_SRGB + 3], m_stroke, zero)
+    out = out + _masked_l1(f["stroke_alpha"], gt[:, I_SALPHA], m_stroke, zero)
+
+    # opacity（合成外观）
+    out = out + _masked_l1(f["opacity"], gt[:, I_OPACITY],
+                           torch.ones(B, dtype=torch.bool, device=device), zero)
+    return out
+
+
+def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor,
+                include_appearance: bool = True) -> torch.Tensor:
     """对匹配对（全部 valid）计算新契约的全块监督。
 
     f / slots_raw / gt 均已按匹配对重排。
@@ -92,15 +131,19 @@ def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor) -> torch.Ten
         torch.stack([f["cx"], f["cy"], f["w"], f["h"]], dim=1),
         gt[:, I_BBOX:I_BBOX + 4],
         torch.ones(B, dtype=torch.bool, device=device), slots_raw)
-    out = out + _masked_l1(f["opacity"], gt[:, I_OPACITY],
-                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    if include_appearance:
+        out = out + _masked_l1(f["opacity"], gt[:, I_OPACITY],
+                               torch.ones(B, dtype=torch.bool, device=device), slots_raw)
 
     # ---- fill ----
+    # 颜色/alpha 项已拆到 _appearance_block（w_fill 独立权重）；
+    # 此处保留渐变几何（gp/radius/stops pos/nstops）。
     ft_gt = gt[:, I_FTYPE:I_FTYPE + 4].argmax(-1)              # [B]
-    m_solid = ft_gt == 1
-    out = out + _masked_l1(f["rgb"], gt[:, I_FRGB:I_FRGB + 3], m_solid, slots_raw)
-    out = out + _masked_l1(f["fill_alpha"], gt[:, I_FALPHA],
-                           torch.ones(B, dtype=torch.bool, device=device), slots_raw)
+    if include_appearance:
+        m_solid = ft_gt == 1
+        out = out + _masked_l1(f["rgb"], gt[:, I_FRGB:I_FRGB + 3], m_solid, slots_raw)
+        out = out + _masked_l1(f["fill_alpha"], gt[:, I_FALPHA],
+                               torch.ones(B, dtype=torch.bool, device=device), slots_raw)
     m_grad = (ft_gt == 2) | (ft_gt == 3)
     n_stops_gt = gt[:, I_NSTOPS]
     j_stops = torch.arange(NUM_STOPS, device=device)
@@ -108,15 +151,16 @@ def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor) -> torch.Ten
     out = out + _masked_l1(f["gp0"], gt[:, I_GP0:I_GP0 + 2], m_grad, slots_raw)
     out = out + _masked_l1(f["gp1"], gt[:, I_GP1:I_GP1 + 2], m_grad, slots_raw)
     out = out + _masked_l1(f["radius"], gt[:, I_GRAD], m_grad, slots_raw)
-    out = out + _masked_l1(f["stops"], gt[:, I_STOPS:I_STOPS + NUM_STOPS * 5]
-                           .reshape(B, NUM_STOPS, 5), m_stop, slots_raw)
+    gt_stops_geom = gt[:, I_STOPS:I_STOPS + NUM_STOPS * 5].reshape(B, NUM_STOPS, 5)
+    out = out + _masked_l1(f["stops"][..., :1], gt_stops_geom[..., :1], m_stop, slots_raw)
     out = out + _masked_l1(f["nstops"], n_stops_gt, m_grad, slots_raw)
 
     # ---- stroke ----
     m_stroke = gt[:, I_SVALID] > 0.5
     out = out + _masked_l1(f["sw"], gt[:, I_SWIDTH], m_stroke, slots_raw)
-    out = out + _masked_l1(f["stroke_rgb"], gt[:, I_SRGB:I_SRGB + 3], m_stroke, slots_raw)
-    out = out + _masked_l1(f["stroke_alpha"], gt[:, I_SALPHA], m_stroke, slots_raw)
+    if include_appearance:
+        out = out + _masked_l1(f["stroke_rgb"], gt[:, I_SRGB:I_SRGB + 3], m_stroke, slots_raw)
+        out = out + _masked_l1(f["stroke_alpha"], gt[:, I_SALPHA], m_stroke, slots_raw)
     nd_gt = gt[:, I_SDASH + NUM_DASH]
     j_dash = torch.arange(NUM_DASH, device=device)
     m_dash = m_stroke.unsqueeze(1) & (j_dash.unsqueeze(0) < nd_gt.unsqueeze(1))
@@ -207,7 +251,8 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
         f_g = {key: val[pred_idx] for key, val in f.items()}
         pred_raw_g = slots_raw[pred_idx]
         gt_g = gt[gt_idx]
-        parts["geom"] = _geom_block(f_g, pred_raw_g, gt_g)
+        parts["geom"] = _geom_block(f_g, pred_raw_g, gt_g, include_appearance=False)
+        parts["appearance"] = _appearance_block(f_g, gt_g)
         parts["bbox"] = F.l1_loss(
             torch.stack([f_g["cx"], f_g["cy"]], dim=1),
             gt_g[:, I_BBOX:I_BBOX + 2])
@@ -228,6 +273,7 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
     else:
         zero = slots_raw.sum() * 0.0
         parts["geom"] = zero
+        parts["appearance"] = zero
         parts["bbox"] = zero
         parts["cls"] = zero
         parts["ftype"] = zero
@@ -261,12 +307,14 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_valid: float = 0.1, w_svalid: float = 0.1,
                    w_geom: float = 0.7, w_bg: float = 0.2,
                    w_div: float = 0.05, w_bbox: float = 0.5,
+                   w_fill: float = 2.0,
                    cls_balance: bool = True) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
     a = matched_auxiliary_losses(slots_raw, bg_raw, slots_gt, bg_gt)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
-                 + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"])
+                 + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"]
+                 + w_fill * a["appearance"])
     total = r["total"] + aux_total
     parts = {"mae": float(r["mae"].detach()),
              "ssim": float(r["ssim"].detach()),
@@ -276,6 +324,7 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
              "valid": float(a["valid"].detach()),
              "svalid": float(a["svalid"].detach()),
              "geom": float(a["geom"].detach()),
+             "appearance": float(a["appearance"].detach()),
              "bbox": float(a["bbox"].detach()),
              "bg": float(a["bg"].detach()),
              "div": float(spatial_diversity(slots_raw).detach()),

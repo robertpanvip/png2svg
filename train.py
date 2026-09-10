@@ -37,6 +37,8 @@ def parse_args():
     p.add_argument("--w-div", type=float, default=0.05)
     p.add_argument("--w-bbox", type=float, default=0.5,
                    help="匹配对象 cx/cy 专项 L1 监督权重，提升 bbox 中心精度")
+    p.add_argument("--w-fill", type=float, default=2.0,
+                   help="外观直接监督权重（fill/stroke 颜色+alpha+opacity，HANDOFF §11.10 P-Appearance）")
     p.add_argument("--anchor-scale", type=float, default=1.0,
                    help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
     p.add_argument("--anchor-anneal-start", type=int, default=99999999,
@@ -89,7 +91,8 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
                                   w_cls=args.w_cls, w_ftype=args.w_ftype,
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
-                                  w_div=args.w_div, w_bbox=args.w_bbox)
+                                  w_div=args.w_div, w_bbox=args.w_bbox,
+                                  w_fill=args.w_fill)
     total.backward()
     return total.detach(), parts
 
@@ -129,8 +132,19 @@ def main():
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         ck = torch.load(args.resume, map_location=args.device)
-        net.load_state_dict(ck["net"])
-        opt.load_state_dict(ck["opt"])
+        state = ck["net"]
+        model_state = net.state_dict()
+        skip = [k for k, v in state.items()
+                if k in model_state and model_state[k].shape != v.shape]
+        if skip:
+            print(f"[resume] shape-mismatch keys re-initialized: {skip}")
+            state = {k: v for k, v in state.items() if k not in skip}
+        net.load_state_dict(state, strict=False)
+        if skip:
+            # 参数形状变了，旧优化器状态（exp_avg 等）形状不匹配 → 全新 Adam
+            print("[resume] optimizer state skipped (fresh Adam)")
+        else:
+            opt.load_state_dict(ck["opt"])
         start_step = int(ck["step"])
         gen._rng.bit_generator.state = ck["gen_rng"]
         print(f"[resume] {args.resume} @ step {start_step}")
@@ -141,7 +155,7 @@ def main():
 
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
-            "geom", "bbox", "bg", "div", "aux", "total"]
+            "geom", "appearance", "bbox", "bg", "div", "aux", "total"]
     avg = {k: 0.0 for k in keys}
     t0 = time.time()
     n_log = 0
