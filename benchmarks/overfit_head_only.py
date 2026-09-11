@@ -24,7 +24,8 @@ def main():
     print(f"mode: {'online' if ONLINE else 'fixed-10-scenes'}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = VectorNet().to(device)
-    ck = torch.load("runs/newrep/last.pt", map_location=device)
+    ckpt = sys.argv[2] if len(sys.argv) > 2 else "runs/newrep/last.pt"
+    ck = torch.load(ckpt, map_location="cpu")
     model_state = net.state_dict()
     skip = [k for k, v in ck["net"].items()
             if k in model_state and model_state[k].shape != v.shape]

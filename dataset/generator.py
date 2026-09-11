@@ -23,18 +23,20 @@ class GeneratorConfig:
     min_objects: int = 2
     max_objects: int = 6
     margin: float = 0.06
-    min_bbox: float = 0.12
-    max_bbox: float = 0.55
-    overlap_prob: float = 0.7
-    alpha_prob: float = 0.35
-    stroke_prob: float = 0.35
-    gradient_prob: float = 0.5
+    # §11.12 A 方案（颜色减压分布）：2026-09-10 诊断证明旧分布下颜色不可提取
+    # （bbox 中位面积 8.7%、open 细条多、bbox 池化 corr 仅 0.42）。收紧后重测。
+    min_bbox: float = 0.18
+    max_bbox: float = 0.60
+    overlap_prob: float = 0.45
+    alpha_prob: float = 0.25
+    stroke_prob: float = 0.30
+    gradient_prob: float = 0.35
     hole_prob: float = 0.18
     transparent_bg_prob: float = 0.3
     max_stops: int = 6
-    # 路径子类型权重（P1 几何）
+    # 路径子类型权重（P1 几何；A 方案：压低纯 open line，closed 形状为主）
     path_weights: dict = field(default_factory=lambda: {
-        "line": 0.15, "poly": 0.15, "quad": 0.15, "cubic": 0.25, "arc": 0.15, "compound": 0.15,
+        "line": 0.08, "poly": 0.18, "quad": 0.18, "cubic": 0.28, "arc": 0.13, "compound": 0.15,
     })
     # P3 stroke 样式
     stroke_attr_prob: float = 0.5
@@ -177,7 +179,9 @@ def _sample_fill(rng, cfg: GeneratorConfig, bbox: BBox) -> Fill:
         g = _sample_gradient(rng, cfg, bbox)
         return Fill(type=g.kind, color=(0.0, 0.0, 0.0), alpha=1.0, gradient=g)
     alpha = float(rng.uniform(0.35, 1.0)) if rng.random() < cfg.alpha_prob else 1.0
-    return Fill(type=FILL_SOLID, color=_sample_color(rng), alpha=alpha)
+    # §11.13：solid 颜色从固定色板采样（分类监督，消灭均值退路）
+    from model.palette import sample_palette_rgb
+    return Fill(type=FILL_SOLID, color=sample_palette_rgb(rng), alpha=alpha)
 
 
 # ---- 路径几何工厂（段坐标均为 uv 局部帧 [0,1]，由 bbox 映射）----
@@ -315,11 +319,11 @@ class SceneGenerator:
             elif kind == "poly":
                 obj = _make_line_path(rng, bbox, closed=True)
             elif kind == "quad":
-                obj = _make_quad_path(rng, bbox, closed=rng.random() < 0.6)
+                obj = _make_quad_path(rng, bbox, closed=rng.random() < 0.8)
             elif kind == "cubic":
-                obj = _make_cubic_path(rng, bbox, closed=rng.random() < 0.7)
+                obj = _make_cubic_path(rng, bbox, closed=rng.random() < 0.85)
             elif kind == "arc":
-                obj = _make_arc_path(rng, bbox, closed=rng.random() < 0.5)
+                obj = _make_arc_path(rng, bbox, closed=rng.random() < 0.7)
             else:
                 obj = _make_compound_path(rng, bbox)
             obj.fill = _sample_fill(rng, cfg, bbox)

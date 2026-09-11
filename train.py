@@ -39,6 +39,8 @@ def parse_args():
                    help="匹配对象 cx/cy 专项 L1 监督权重，提升 bbox 中心精度")
     p.add_argument("--w-fill", type=float, default=2.0,
                    help="外观直接监督权重（fill/stroke 颜色+alpha+opacity，HANDOFF §11.10 P-Appearance）")
+    p.add_argument("--w-palette", type=float, default=0.5,
+                   help="§11.13 色板分类 CE 权重（solid fill 颜色 48 类）")
     p.add_argument("--anchor-scale", type=float, default=1.0,
                    help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
     p.add_argument("--anchor-anneal-start", type=int, default=99999999,
@@ -83,6 +85,9 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
     slots_gt, bg_gt = encode_scene(scene)
     slots, aux, bg = net(img_gt.unsqueeze(0).to(device), anchor_scale=anchor_scale)
     slots = slots[0]
+    # NaN 防护（前移）：偶发发散步在渲染前就拦截（§11.12 nseg NaN 崩溃教训）
+    if not (torch.isfinite(slots).all() and torch.isfinite(bg[0]).all()):
+        return None, {}
     bg_raw = bg[0]
     objs, bg_s = slots_to_objs(slots, bg_raw, args.size, args.pad_px)
     img_pred = ren._render_objs(objs, bg_s)
@@ -92,7 +97,13 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
                                   w_valid=args.w_valid, w_svalid=args.w_svalid,
                                   w_geom=args.w_geom, w_bg=args.w_bg,
                                   w_div=args.w_div, w_bbox=args.w_bbox,
-                                  w_fill=args.w_fill)
+                                  w_fill=args.w_fill,
+                                  w_palette=getattr(args, "w_palette", 0.5),
+                                  palette_logits=aux.get("palette"))
+    # NaN 防护：偶发发散步直接跳过（§11.12 11k 步崩溃教训）
+    if not torch.isfinite(total):
+        opt.zero_grad(set_to_none=True)
+        return None, parts
     total.backward()
     return total.detach(), parts
 
@@ -136,12 +147,16 @@ def main():
         model_state = net.state_dict()
         skip = [k for k, v in state.items()
                 if k in model_state and model_state[k].shape != v.shape]
-        if skip:
-            print(f"[resume] shape-mismatch keys re-initialized: {skip}")
+        new_keys = [k for k in model_state if k not in state]
+        if skip or new_keys:
+            if skip:
+                print(f"[resume] shape-mismatch keys re-initialized: {skip}")
+            if new_keys:
+                print(f"[resume] new params (fresh init): {new_keys}")
             state = {k: v for k, v in state.items() if k not in skip}
         net.load_state_dict(state, strict=False)
-        if skip:
-            # 参数形状变了，旧优化器状态（exp_avg 等）形状不匹配 → 全新 Adam
+        if skip or new_keys:
+            # 参数结构变了，旧优化器状态（exp_avg 等）不匹配 → 全新 Adam
             print("[resume] optimizer state skipped (fresh Adam)")
         else:
             opt.load_state_dict(ck["opt"])
@@ -155,7 +170,7 @@ def main():
 
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
-            "geom", "appearance", "bbox", "bg", "div", "aux", "total"]
+            "geom", "appearance", "palette", "bbox", "bg", "div", "aux", "total"]
     avg = {k: 0.0 for k in keys}
     t0 = time.time()
     n_log = 0
@@ -167,6 +182,8 @@ def main():
         opt.zero_grad(set_to_none=True)
         a_scale = anchor_scale_at(step, args)
         total, parts = train_step(net, ren, gen, args, args.device, a_scale)
+        if total is None:   # NaN 防护：跳过本步
+            continue
         gn = torch.nn.utils.clip_grad_norm_(net.parameters(), args.grad_clip)
         opt.step()
 

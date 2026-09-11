@@ -7,8 +7,8 @@ import torch.nn.functional as F
 import math
 
 from model.targets import (
-    NUM_SLOTS, SLOT_DIM, BG_DIM, I_BBOX, I_SEG, I_FTYPE, I_SVALID, I_OPACITY,
-    I_GROUP, I_END, N_SEG, SEG_DIM,
+    NUM_SLOTS, SLOT_DIM, BG_DIM, I_BBOX, I_SEG, I_FTYPE, I_FRGB, I_SVALID,
+    I_OPACITY, I_GROUP, I_END, N_SEG, SEG_DIM,
 )
 from model.spec import C_MIN, C_MAX, W_MIN, W_MAX
 
@@ -182,6 +182,14 @@ class VectorNet(nn.Module):
         self.fill_head = nn.Sequential(
             nn.Linear(d_model + self.HR_DIM + 4, 256), nn.SiLU(), nn.Linear(256, _FILL_W),
         )
+        # §11.13 色板分类头（N_PAL=48 类 logits）。
+        # 输入必须是 color_in（h+hrf+cf_raw）：h 本身无颜色信息（§11.11 定案），
+        # 只接 h 的分类头学不到读色（昨晚 pal CE 卡 ln(48) 随机水平的根因）。
+        from model.palette import N_PALETTE, PALETTE_RGB
+        self.palette_head = nn.Linear(d_model + self.HR_DIM + 4, N_PALETTE)
+        self.register_buffer("palette_rgb",
+                             torch.from_numpy(PALETTE_RGB))          # [48,3]
+        self.I_FRGB_OFF = I_FRGB - I_FTYPE                            # 槽内偏移
         self.stroke_head = nn.Sequential(
             nn.Linear(d_model + self.HR_DIM + 4, 128), nn.SiLU(), nn.Linear(128, _STROKE_W),
         )
@@ -269,6 +277,12 @@ class VectorNet(nn.Module):
         color_in = torch.cat([h, hrf, cf_raw], dim=-1)         # [B,K,324]
         fill = self.fill_head(color_in)
         stroke = self.stroke_head(color_in)
+        # §11.13 色板分类：solid fill 颜色改为 palette softmax 加权色（可微），
+        # 直接写入契约 rgb 字段——渲染/解码自动一致，CE 提供强分类梯度，
+        # 消灭"回归均值灰"的退路。logits 经 aux 返回供损失监督。
+        pal_logits = self.palette_head(color_in)               # [B,K,N_PAL]
+        pal_soft = torch.softmax(pal_logits, dim=-1) @ self.palette_rgb
+        fill[..., self.I_FRGB_OFF:self.I_FRGB_OFF + 3] = pal_soft
         fx = self.fx_head(h)
         comp = self.comp_head(h)
         spare = SLOT_DIM - I_END
@@ -279,7 +293,7 @@ class VectorNet(nn.Module):
         # 后期退火到 0 让对象学到任意连续位置（消除网格偏置）。
         slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
                                          + self.spatial_anchor * anchor_scale)
-        aux = {}  # 类/ftype 已并入 slot 向量（one-hot 块），辅助头随 #26 移除
+        aux = {"palette": pal_logits}
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg
 

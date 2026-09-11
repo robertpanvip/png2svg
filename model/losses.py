@@ -204,7 +204,8 @@ def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor,
 
 
 def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
-                             slots_gt, bg_gt) -> dict:
+                             slots_gt, bg_gt,
+                             palette_logits: torch.Tensor = None) -> dict:
     """带 Hungarian 匹配的辅助损失（新契约）。
 
     代价 = bbox L1 + 段类型 NLL（几何签名）。匹配对上施加段表/属性块监督；
@@ -253,6 +254,21 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
         gt_g = gt[gt_idx]
         parts["geom"] = _geom_block(f_g, pred_raw_g, gt_g, include_appearance=False)
         parts["appearance"] = _appearance_block(f_g, gt_g)
+        # §11.13 色板 CE：GT solid 对象 → 最近色板 id，在匹配对上监督
+        if palette_logits is not None:
+            from model.palette import rgb_to_id
+            if palette_logits.dim() == 3:
+                palette_logits = palette_logits[0]
+            pal_g = palette_logits[pred_idx]                   # [M,N_PAL]
+            ft_g2 = gt_g[:, I_FTYPE:I_FTYPE + 4].argmax(-1)
+            m_sol = ft_g2 == 1
+            if bool(m_sol.any()):
+                gt_rgb = gt_g[m_sol][:, I_FRGB:I_FRGB + 3].detach().cpu().numpy()
+                pal_id = torch.as_tensor(rgb_to_id(gt_rgb), device=device,
+                                         dtype=torch.long)
+                parts["palette"] = F.cross_entropy(pal_g[m_sol], pal_id)
+            else:
+                parts["palette"] = slots_raw.sum() * 0.0
         parts["bbox"] = F.l1_loss(
             torch.stack([f_g["cx"], f_g["cy"]], dim=1),
             gt_g[:, I_BBOX:I_BBOX + 2])
@@ -274,6 +290,7 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
         zero = slots_raw.sum() * 0.0
         parts["geom"] = zero
         parts["appearance"] = zero
+        parts["palette"] = slots_raw.sum() * 0.0
         parts["bbox"] = zero
         parts["cls"] = zero
         parts["ftype"] = zero
@@ -307,14 +324,19 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_valid: float = 0.1, w_svalid: float = 0.1,
                    w_geom: float = 0.7, w_bg: float = 0.2,
                    w_div: float = 0.05, w_bbox: float = 0.5,
-                   w_fill: float = 2.0,
+                   w_fill: float = 2.0, w_palette: float = 0.5,
+                   palette_logits: torch.Tensor = None,
                    cls_balance: bool = True) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
-    a = matched_auxiliary_losses(slots_raw, bg_raw, slots_gt, bg_gt)
+    a = matched_auxiliary_losses(slots_raw, bg_raw, slots_gt, bg_gt,
+                                 palette_logits=palette_logits)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
                  + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"]
                  + w_fill * a["appearance"])
+    # §11.13 色板 CE：palette_logits 由调用方经 kwargs 传入
+    if "palette" in a:
+        aux_total = aux_total + w_palette * a["palette"]
     total = r["total"] + aux_total
     parts = {"mae": float(r["mae"].detach()),
              "ssim": float(r["ssim"].detach()),
@@ -325,6 +347,7 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
              "svalid": float(a["svalid"].detach()),
              "geom": float(a["geom"].detach()),
              "appearance": float(a["appearance"].detach()),
+             "palette": float(a["palette"].detach()) if "palette" in a else 0.0,
              "bbox": float(a["bbox"].detach()),
              "bg": float(a["bg"].detach()),
              "div": float(spatial_diversity(slots_raw).detach()),

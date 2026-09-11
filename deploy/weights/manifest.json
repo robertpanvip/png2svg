@@ -1,0 +1,9 @@
+{
+  "source_ckpt": "E:\\AI-workspace\\png2svg\\png2svg\\runs\\newrep\\last.pt",
+  "params": 5027832,
+  "fp32_mb": 19.21,
+  "int8_mb": 16.72,
+  "quantization": "dynamic qint8 on torch.nn.Linear (conv fp32)",
+  "arch": "VectorNet 280-dim path-segment contract (HANDOFF §11.6)",
+  "note": "int8 权重需用 quantize_dynamic 重建模型后 strict load（见 deploy/predict.py）"
+}
