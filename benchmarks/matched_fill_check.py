@@ -4,12 +4,15 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
 import torch
 
-sys.path.insert(0, ".")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+os.chdir(_ROOT)
 
 from dataset.generator import SceneGenerator
 from dataset.renderer import SoftSVGRenderer
@@ -62,6 +65,8 @@ def main():
     gen = SceneGenerator(None, 777000)
 
     n_scene = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    solid_l1 = []
+    gray_l1 = []
     with torch.no_grad():
         for si in range(n_scene):
             scene = gen.sample()
@@ -82,7 +87,9 @@ def main():
                 if ft == 1:
                     pr = f["rgb"][k].cpu().numpy()
                     gr = gt[g, I_FRGB:I_FRGB + 3]
-                    d = np.abs(pr - gr).mean()
+                    d = float(np.abs(pr - gr).mean())
+                    solid_l1.append(d)
+                    gray_l1.append(float(np.abs(0.37 - gr).mean()))
                     print(f"  slot{k}<->gt{g} solid  pred={pr.round(2)} gt={gr.round(2)} L1={d:.3f}")
                 elif ft == 0:
                     print(f"  slot{k}<->gt{g} none   pred_ftype={f['ftype'][k].argmax().item()} "
@@ -94,6 +101,11 @@ def main():
                     d = np.abs(ps[:, 1:4] - gs[:, 1:4]).mean()
                     print(f"  slot{k}<->gt{g} {name:6s} pred_stops={ps[:, 1:4].round(2).tolist()} "
                           f"gt={gs[:, 1:4].round(2).tolist()} L1={d:.3f}")
+
+    if solid_l1:
+        print(f"\n==== SUMMARY ({len(solid_l1)} solid matched pairs, {n_scene} scenes) ====")
+        print(f"pred fill rgb L1 = {np.mean(solid_l1):.3f}   (灰均值 0.37 基线 L1 = {np.mean(gray_l1):.3f})")
+        print(f"胜过灰基线的对数 = {sum(1 for a, b in zip(solid_l1, gray_l1) if a < b)}/{len(solid_l1)}")
 
 
 if __name__ == "__main__":

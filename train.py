@@ -5,10 +5,17 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 
 import numpy as np
 import torch
+
+# 自定位：无论从哪个 cwd 启动，import 与 runs/ 相对路径都锚定项目根
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+os.chdir(_ROOT)
 
 from dataset.generator import SceneGenerator
 from dataset.renderer import SoftSVGRenderer
@@ -41,6 +48,8 @@ def parse_args():
                    help="外观直接监督权重（fill/stroke 颜色+alpha+opacity，HANDOFF §11.10 P-Appearance）")
     p.add_argument("--w-palette", type=float, default=0.5,
                    help="§11.13 色板分类 CE 权重（solid fill 颜色 48 类）")
+    p.add_argument("--w-mask", type=float, default=1.0,
+                   help="E 方案填充掩码 BCE+Dice 权重（§11.15：先分割再取色）")
     p.add_argument("--anchor-scale", type=float, default=1.0,
                    help="spatial_anchor 缩放：训练早期=1.0 打破对称，后期退火到此值释放网格偏置")
     p.add_argument("--anchor-anneal-start", type=int, default=99999999,
@@ -83,6 +92,8 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
     scene = gen.sample()
     img_gt = ren.render_scene(scene).detach()
     slots_gt, bg_gt = encode_scene(scene)
+    # E 方案：逐对象填充掩码 GT（32×32，与模型 hr token 网格同分辨率）
+    masks_gt = ren.render_fill_masks(scene, out_size=args.size // 8).cpu().numpy()
     slots, aux, bg = net(img_gt.unsqueeze(0).to(device), anchor_scale=anchor_scale)
     slots = slots[0]
     # NaN 防护（前移）：偶发发散步在渲染前就拦截（§11.12 nseg NaN 崩溃教训）
@@ -99,7 +110,10 @@ def train_step(net, ren, gen, args, device, anchor_scale: float = 1.0):
                                   w_div=args.w_div, w_bbox=args.w_bbox,
                                   w_fill=args.w_fill,
                                   w_palette=getattr(args, "w_palette", 0.5),
-                                  palette_logits=aux.get("palette"))
+                                  w_mask=getattr(args, "w_mask", 1.0),
+                                  palette_logits=aux.get("palette"),
+                                  mask_logits=aux.get("mask"),
+                                  masks_gt=masks_gt)
     # NaN 防护：偶发发散步直接跳过（§11.12 11k 步崩溃教训）
     if not torch.isfinite(total):
         opt.zero_grad(set_to_none=True)
@@ -170,7 +184,8 @@ def main():
 
     log_path = os.path.join(args.out, "log.jsonl")
     keys = ["mae", "ssim", "render", "cls", "ftype", "valid", "svalid",
-            "geom", "appearance", "palette", "bbox", "bg", "div", "aux", "total"]
+            "geom", "appearance", "palette", "mask", "bbox", "bg", "div",
+            "aux", "total"]
     avg = {k: 0.0 for k in keys}
     t0 = time.time()
     n_log = 0
@@ -202,6 +217,7 @@ def main():
             print(f"[{step + 1}/{args.steps}] total={m['total']:.4f} "
                   f"render={m['render']:.4f} mae={m['mae']:.4f} "
                   f"geom={m['geom']:.4f} bbox={m['bbox']:.4f} "
+                  f"mask={m.get('mask', 0.0):.4f} app={m['appearance']:.4f} "
                   f"asc={a_scale:.2f} gn={float(gn):.2f} "
                   f"({sps:.2f} it/s)", flush=True)
             avg = {k: 0.0 for k in keys}

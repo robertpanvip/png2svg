@@ -205,7 +205,9 @@ def _geom_block(f: dict, slots_raw: torch.Tensor, gt: torch.Tensor,
 
 def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
                              slots_gt, bg_gt,
-                             palette_logits: torch.Tensor = None) -> dict:
+                             palette_logits: torch.Tensor = None,
+                             mask_logits: torch.Tensor = None,
+                             masks_gt=None) -> dict:
     """带 Hungarian 匹配的辅助损失（新契约）。
 
     代价 = bbox L1 + 段类型 NLL（几何签名）。匹配对上施加段表/属性块监督；
@@ -245,6 +247,7 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
     matched_pred = [k for k in assign if k >= 0]
     parts = {}
     valid_target = torch.zeros(n, device=device)
+    pred_idx = gt_idx = None
     if matched_pred:
         pred_idx = torch.tensor(matched_pred, device=device)
         gt_idx = torch.tensor([g for g in range(n) if assign[g] >= 0], device=device)
@@ -296,6 +299,32 @@ def matched_auxiliary_losses(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
         parts["ftype"] = zero
         parts["svalid"] = zero
 
+    # ---- E 方案：填充掩码 dense 监督（§11.15：先分割再取色）----
+    # 匹配对 slot 监督对应 GT 对象填充掩码；未匹配 slot 掩码压 0（抑制幻影区域）。
+    if mask_logits is not None and masks_gt is not None:
+        if mask_logits.dim() == 4:
+            mask_logits = mask_logits[0]                       # [K,gh,gw]
+        gt_m = torch.as_tensor(np.asarray(masks_gt), dtype=torch.float32,
+                               device=device)
+        if gt_m.shape[0] < mask_logits.shape[0]:
+            pad = torch.zeros(mask_logits.shape[0] - gt_m.shape[0],
+                              *gt_m.shape[1:], device=device)
+            gt_m = torch.cat([gt_m, pad], dim=0)
+        tgt = torch.zeros_like(mask_logits)
+        if pred_idx is not None:
+            tgt[pred_idx] = gt_m[gt_idx]
+        # BCE 用 logits 版（数值稳定）。v1 的 sigmoid+clamp(1e-6) 在掩码
+        # 坍缩到全零后梯度死区（clamp 处 d/dlogit=0），永久卡死——教训。
+        bce = F.binary_cross_entropy_with_logits(mask_logits, tgt)
+        pm = torch.sigmoid(mask_logits)
+        flat = pm.reshape(pm.shape[0], -1)
+        tf = tgt.reshape(tgt.shape[0], -1)
+        dice = 1.0 - (2.0 * (flat * tf).sum(1) + 1.0) / \
+            (flat.sum(1) + tf.sum(1) + 1.0)                    # smooth dice，空掩码安全
+        parts["mask"] = bce + dice.mean()
+    else:
+        parts["mask"] = slots_raw.sum() * 0.0
+
     parts["valid"] = F.binary_cross_entropy(
         f["valid"].clamp(1e-6, 1.0 - 1e-6), valid_target)
 
@@ -325,15 +354,19 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
                    w_geom: float = 0.7, w_bg: float = 0.2,
                    w_div: float = 0.05, w_bbox: float = 0.5,
                    w_fill: float = 2.0, w_palette: float = 0.5,
+                   w_mask: float = 1.0,
                    palette_logits: torch.Tensor = None,
+                   mask_logits: torch.Tensor = None,
+                   masks_gt=None,
                    cls_balance: bool = True) -> tuple:
     r = render_losses(img_pred, img_gt, ssim_weight)
     a = matched_auxiliary_losses(slots_raw, bg_raw, slots_gt, bg_gt,
-                                 palette_logits=palette_logits)
+                                 palette_logits=palette_logits,
+                                 mask_logits=mask_logits, masks_gt=masks_gt)
     aux_total = (w_cls * a["cls"] + w_ftype * a["ftype"] + w_valid * a["valid"]
                  + w_svalid * a["svalid"] + w_geom * a["geom"] + w_bg * a["bg"]
                  + w_div * spatial_diversity(slots_raw) + w_bbox * a["bbox"]
-                 + w_fill * a["appearance"])
+                 + w_fill * a["appearance"] + w_mask * a["mask"])
     # §11.13 色板 CE：palette_logits 由调用方经 kwargs 传入
     if "palette" in a:
         aux_total = aux_total + w_palette * a["palette"]
@@ -348,6 +381,7 @@ def compute_losses(img_pred: torch.Tensor, img_gt: torch.Tensor,
              "geom": float(a["geom"].detach()),
              "appearance": float(a["appearance"].detach()),
              "palette": float(a["palette"].detach()) if "palette" in a else 0.0,
+             "mask": float(a["mask"].detach()) if "mask" in a else 0.0,
              "bbox": float(a["bbox"].detach()),
              "bg": float(a["bg"].detach()),
              "div": float(spatial_diversity(slots_raw).detach()),

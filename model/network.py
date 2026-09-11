@@ -173,25 +173,46 @@ class VectorNet(nn.Module):
         self.hr_ffn = nn.Sequential(
             nn.Linear(self.HR_DIM, 128), nn.SiLU(), nn.Linear(128, self.HR_DIM),
         )
+        # ---- E 方案：填充掩码解码头（HANDOFF §11.15：先分割再取色）----
+        # Mask2Former-lite：slot mask query 经 1 层 cross-attn 精化后与
+        # pixel embedding 做点积 → [B,K,32,32] logits。
+        # v1（纯点积）在过拟合探针 400-600 步 IoU 平台于 0.41（门 0.60）——
+        # 单 query 向量表达不了凹形/复合形状，加查询精化 + 独立 pix embed。
+        self.mask_tok = nn.Sequential(
+            nn.Conv2d(self.HR_DIM - 4, self.HR_DIM, 1), nn.SiLU(),
+            nn.Conv2d(self.HR_DIM, self.HR_DIM, 3, padding=1), nn.SiLU(),
+        )
+        self.mask_qproj = nn.Linear(d_model, self.HR_DIM)
+        self.mask_attn = nn.MultiheadAttention(self.HR_DIM, 4, batch_first=True)
+        self.mask_n1 = nn.LayerNorm(self.HR_DIM)
+        self.mask_n2 = nn.LayerNorm(self.HR_DIM)
+        self.mask_ffn = nn.Sequential(
+            nn.Linear(self.HR_DIM, 128), nn.SiLU(), nn.Linear(128, self.HR_DIM),
+        )
+        self.mask_pix = nn.Sequential(
+            nn.Conv2d(self.HR_DIM, self.HR_DIM, 1), nn.SiLU(),
+            nn.Conv2d(self.HR_DIM, self.HR_DIM, 1),
+        )
+        self.mask_bias = nn.Parameter(torch.zeros(num_slots))
         # 分块输出头（§11.6 契约）：段表用宽 MLP，其余块轻量。
-        # fill/stroke 头消费 [h, hr_feat]（颜色显式通路）。
+        # fill/stroke 头消费 color_in = [h, hrf, cf_raw, cf_mask]
+        # （+8 = 两种原始 RGBA 池化各 4 维）。
         self.geom_head = nn.Linear(d_model, _GEOM_W)
         self.seg_head = nn.Sequential(
             nn.Linear(d_model, 512), nn.SiLU(), nn.Linear(512, _SEG_W),
         )
         self.fill_head = nn.Sequential(
-            nn.Linear(d_model + self.HR_DIM + 4, 256), nn.SiLU(), nn.Linear(256, _FILL_W),
+            nn.Linear(d_model + self.HR_DIM + 8, 256), nn.SiLU(), nn.Linear(256, _FILL_W),
         )
         # §11.13 色板分类头（N_PAL=48 类 logits）。
-        # 输入必须是 color_in（h+hrf+cf_raw）：h 本身无颜色信息（§11.11 定案），
-        # 只接 h 的分类头学不到读色（昨晚 pal CE 卡 ln(48) 随机水平的根因）。
+        # 输入必须是 color_in（h 本身无颜色信息，§11.11 定案）。
         from model.palette import N_PALETTE, PALETTE_RGB
-        self.palette_head = nn.Linear(d_model + self.HR_DIM + 4, N_PALETTE)
+        self.palette_head = nn.Linear(d_model + self.HR_DIM + 8, N_PALETTE)
         self.register_buffer("palette_rgb",
                              torch.from_numpy(PALETTE_RGB))          # [48,3]
         self.I_FRGB_OFF = I_FRGB - I_FTYPE                            # 槽内偏移
         self.stroke_head = nn.Sequential(
-            nn.Linear(d_model + self.HR_DIM + 4, 128), nn.SiLU(), nn.Linear(128, _STROKE_W),
+            nn.Linear(d_model + self.HR_DIM + 8, 128), nn.SiLU(), nn.Linear(128, _STROKE_W),
         )
         self.fx_head = nn.Linear(d_model, _FX_W)
         self.comp_head = nn.Linear(d_model, _COMP_W)
@@ -218,11 +239,12 @@ class VectorNet(nn.Module):
                  w: torch.Tensor, hgt: torch.Tensor):
         """高分辨率颜色特征：确定性原始颜色池化 + slot cross-attention。
 
-        返回 (hrf [B,K,64], cf_raw [B,K,4])：
+        返回 (hrf [B,K,64], cf_raw [B,K,4], ctx [B,60,gh,gw], rawt [B,T,4])：
         - cf_raw：8px 原始 RGBA token 按 bbox 中心高斯加权均值（零学习，
           泛化由构造保证，corr≈0.42 起步）；
         - hrf：query=proj(h)+bbox 中心位置编码，对 [ctx‖raw] token 做
-          attention（学到后可逼近 oracle 内部采样 0.65）。
+          attention（学到后可逼近 oracle 内部采样 0.65）；
+        - ctx/rawt：供掩码头（E 方案）与掩码内池化复用，避免二次前向。
         """
         b = img.shape[0]
         hr = self.hr_encoder(img)                              # [B,60,gh,gw]
@@ -248,7 +270,7 @@ class VectorNet(nn.Module):
         wgt = (gwy.unsqueeze(3) * gwx.unsqueeze(2)).reshape(b, -1, gh * gw)          # [B,K,T]
         wsum = wgt.sum(-1, keepdim=True).clamp(min=1e-6)
         cf_raw = torch.einsum("bkt,btc->bkc", wgt, rawt) / wsum
-        return hrf, cf_raw
+        return hrf, cf_raw, hr, rawt
 
     def forward(self, img, anchor_scale: float = 1.0):
         feats = self.encoder(img)
@@ -273,8 +295,40 @@ class VectorNet(nn.Module):
                   C_MIN, C_MAX).detach()
         bw = _lin(geom[..., I_BBOX + 2], W_MIN, W_MAX).detach()
         bh = _lin(geom[..., I_BBOX + 3], W_MIN, W_MAX).detach()
-        hrf, cf_raw = self._hr_feat(img, h, cx, cy, bw, bh)    # [B,K,64],[B,K,4]
-        color_in = torch.cat([h, hrf, cf_raw], dim=-1)         # [B,K,324]
+        hrf, cf_raw, hr_ctx, rawt = self._hr_feat(img, h, cx, cy, bw, bh)
+        # ---- E 方案：掩码预测 + 掩码内池化取色（§11.15）----
+        # v2：query cross-attn 精化 + pixel embedding 点积。取色梯度经池化
+        # 权重反传回掩码头：取色需求直接塑造分割。
+        gh, gw = hr_ctx.shape[-2:]
+        mfeat = self.mask_tok(hr_ctx)                          # [B,64,gh,gw]
+        T = gh * gw
+        mft = mfeat.flatten(2).transpose(1, 2)                 # [B,T,64]
+        pe = _sine_pos_2d(self.HR_DIM, gh, gw, mft.device, mft.dtype)
+        mft = mft + pe
+        pix = self.mask_pix(mfeat).flatten(2).transpose(1, 2)  # [B,T,64]
+        q = self.mask_qproj(h)                                 # [B,K,64]
+        x = self.mask_n1(q)
+        q = q + self.mask_attn(x, mft, mft, need_weights=False)[0]
+        q = q + self.mask_ffn(self.mask_n2(q))
+        mask_logits = (torch.einsum("bkc,btc->bkt", q, pix)
+                       * (self.HR_DIM ** -0.5)
+                       + self.mask_bias.view(1, -1, 1))       # bias 对齐 K 维
+        mask_logits = mask_logits.reshape(b, self.num_slots, gh, gw)
+        # cf_mask 像素粒度池化（E-v3）：掩码上采样到输入分辨率后逐像素
+        # 加权原始颜色，再按 8px 块聚合。v2 的 token 粒度（整块 token
+        # 均值）被描边/背景污染，探针实测天花板≈灰（0.26）；像素粒度
+        # （边界像素低权重=内置腐蚀）实测 0.17-0.20 < 灰 0.23-0.26。
+        pm = torch.sigmoid(mask_logits)                            # [B,K,gh,gw]
+        blk = img.shape[-1] // gh
+        pm_up = F.interpolate(pm, size=img.shape[-2:], mode="bilinear",
+                              align_corners=False)                 # [B,K,H,W]
+        prod = F.avg_pool2d(
+            (pm_up.unsqueeze(2) * img.unsqueeze(1)).flatten(0, 1),
+            blk).reshape(b, self.num_slots, 4, gh, gw)             # [B,K,4,gh,gw]
+        mass = F.avg_pool2d(pm_up, blk)                            # [B,K,gh,gw]
+        cf_mask = (torch.einsum("bkchw,bkhw->bkc", prod, mass)
+                   / mass.sum((2, 3)).clamp_min(1e-6).unsqueeze(-1))  # [B,K,4]
+        color_in = torch.cat([h, hrf, cf_raw, cf_mask], dim=-1)   # [B,K,328]
         fill = self.fill_head(color_in)
         stroke = self.stroke_head(color_in)
         # §11.13 色板分类：solid fill 颜色改为 palette softmax 加权色（可微），
@@ -293,7 +347,7 @@ class VectorNet(nn.Module):
         # 后期退火到 0 让对象学到任意连续位置（消除网格偏置）。
         slots[..., I_BBOX:I_BBOX + 2] = (slots[..., I_BBOX:I_BBOX + 2]
                                          + self.spatial_anchor * anchor_scale)
-        aux = {"palette": pal_logits}
+        aux = {"palette": pal_logits, "mask": mask_logits}
         bg = self.bg_head(tokens.mean(dim=1))
         return slots, aux, bg
 

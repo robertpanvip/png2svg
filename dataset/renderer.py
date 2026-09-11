@@ -210,6 +210,38 @@ class SoftSVGRenderer:
         self.sub_px = max(1, int(sub_px))
         self.chunk_points = int(chunk_points)
         self.grad_checkpoint = bool(grad_checkpoint)
+        self._mask_renderers = {}   # out_size -> 低分辨率掩码渲染器缓存
+
+    def render_fill_masks(self, scene: Scene, out_size: int = 32) -> torch.Tensor:
+        """逐对象填充区掩码 GT（E 方案，HANDOFF §11.15：先分割再取色）。
+
+        返回 [K, out_size, out_size] float ∈[0,1]，K=len(scene.objects)，
+        顺序与 encode_scene 一致（调用方 pad 到 NUM_SLOTS）。掩码 = 该对象
+        fill coverage（软 parity/带符号距离覆盖），**不含描边**（描边是
+        白/黑污染源，正是 bbox/路径取色路线全败的根因），fill=none 恒 0。
+        """
+        S = int(out_size)
+        mren = self._mask_renderers.get(S)
+        if mren is None:
+            mren = SoftSVGRenderer(S, device=self.device, dtype=self.dtype,
+                                   gamma_px=0.5, zeta_px=0.05,
+                                   samples_per_curve=24, pad_px=1.0, sub_px=1)
+            self._mask_renderers[S] = mren
+        objs = mren._prepare(scene)
+        masks = []
+        for item in objs:
+            full = torch.zeros(S, S, dtype=self.dtype, device=self.device)
+            x0, y0, x1, y1 = item["crop"]
+            if x1 > x0 and y1 > y0 and item["fill"] is not None:
+                p = mren._pixel_grid(x0, y0, x1, y1)
+                fills, _ = mren._object_coverage(item["geo"], p)
+                cov = None
+                for a_sub in fills:
+                    cov = a_sub if cov is None else (cov + a_sub - 2.0 * cov * a_sub)
+                if cov is not None:
+                    full[y0:y1, x0:x1] = cov.clamp(0.0, 1.0).reshape(y1 - y0, x1 - x0)
+            masks.append(full)
+        return torch.stack(masks)
 
     def _prepare(self, scene: Scene):
         S = self.S
