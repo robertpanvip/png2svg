@@ -775,4 +775,87 @@ cf_mask L1 两次**完全持平 0.404**，4000 步（约 35 分钟 GPU 训练）
 
 **结论**：E 路线泛化证伪，关闭。颜色瓶颈在当前架构 + 数据分布下**最终关闭**——至此 §11.11 以来的全部取色路线（直接 L1 加权、ROI 统计、HR 分支、梯度累积、预测掩码池化、分布减压 A、色板分类 §11.13/§11.15、填充掩码辅助 E）均已证伪或关闭。cf_raw/cf_mask 级特征不足以支撑颜色判别，把"从图像提取逐对象颜色"作为当前形态模型的长期课题挂起。
 
-**转向决定（用户预案已批准）**：终止 genE2 训练（28k 步处 taskkill，last.pt 保留），转 **D 路线：颜色接受吸收，优先 P3b dash 描边 → P4 effects（可微 blur/shadow/glow）**。几何/结构管线可用性不受影响（匹配 100%、形状准），部署价值不受阻。可用起点：runs/genE2/last.pt（几何无退化）。
+**转向决定（用户预案已批准）**：终止 genE2 训练（28k 步处 taskkill，last.pt 保留），转 **D 路线：颜色接受吸收，优先 P3b dash 描边 → P4 effects（可微 blur/shadow/glow）**。几何/结构管线可用性不受影响（匹配 100%、形状准），部署价值不受阻。可用起点：**runs/genE/last.pt（22k，权重 finite 已验证）**。⚠️ runs/genE2/last.pt 虽标签 step=40000 但权重输出全 NaN（02:12 写入，疑似睡眠唤醒后异常进程落盘的坏档），已弃用勿 resume。另：唤醒后 nvidia-smi 报 NVML 错误，下次 GPU 训练前建议先重启或验证驱动。
+
+## §11.17 转向 D：P3b/P4 缺口清单（2026-09-12 凌晨，只读代码摸底）
+
+> 逐文件核查结果：**编码侧（scene_graph/generator/targets/spec.squash/network 头/losses）对 dash 和 effects 已全部就绪，无需任何改动；缺口集中在渲染与导出两端**——SoftSVGRenderer 完全忽略 dash/linecap/linejoin/effects（GT 训练图里就没有虚线和特效 → 渲染损失看不见），serializer 不写 stroke-dasharray 和 filter（导出 SVG 丢失）。槽位契约无需扩容。
+
+### 11.17.1 P3b dash 缺口（编码有 / 渲染无 / 损失有 / 导出无）
+
+| 环节 | 状态 | 位置 |
+|---|---|---|
+| 数据模型 | ✅ 有 | `svg/scene_graph.py:113-119` Stroke.dash/linecap/linejoin；validate 校验 dash∈[0,1]（:367） |
+| 数据生成 | ✅ 有 | `dataset/generator.py:273-279` 产 1..4 个 dash 值（uv 0.02–0.12）+ cap/join |
+| 槽位编码 | ✅ 有 | `model/targets.py:199-203` encode（I_SDASH 239..243，第 5 槽=数量）；`:290-297` decode |
+| squash/raw/硬化 | ✅ 有 | `model/spec.py:67-70`（dash/ndash sigmoid，cap/join raw logits）、`:340-347` targets_to_raw、`:423-429` predictions_to_targets |
+| 网络头 | ✅ 有 | `model/network.py:90` _STROKE_W=17，stroke_head 输出含 dash/cap/join |
+| 辅助损失 | ✅ 有 | `model/losses.py:164-169` dash masked-L1 + ndash L1；`:170-174` cap/join CE（匹配对上） |
+| **可微渲染** | ❌ **无** | `dataset/renderer.py:280-286` `_prepare` stroke_spec 仅 (半宽,色,alpha)，**dash/cap/join 被丢弃**；`:446-450` stroke coverage 是纯距离带 `sigmoid((hw−d)/γ)`，无弧长参数化。`model/spec.py:283-285` soft 路径同（docstring :249-255 明示暂缺） |
+| **serializer** | ❌ **无** | `svg/serializer.py:115-120` 只写 color/width；**linecap/linejoin 硬编码 "round"/"round"（现存 bug，无视对象实际值）**；不写 stroke-dasharray |
+| resvg 通道 | ✅ 具备 | resvg 原生支持 dash——serializer 写出即可见 |
+
+**P3b 实现要点与难度**：
+1. serializer 补 dash/cap/join（小，~15 行）：dash 值 uv → `×max(w,h)` 转 user units；顺带修 cap/join 硬编码 bug。
+2. 可微 dash 渲染（**中，唯一难点**）：在 `_object_layer`/`_build_geo` 的折线点上累计**弧长 s**（Σ相邻点距，对 pts 可微），dash gate = smooth pattern：`½·(1±tanh((frac(s/(dash·S))−0.5)/τ))` 之类平滑方波，乘进 stroke coverage。注意 soft renderer 内 pts 已是 abs 画布单位，dash 槽存的是 uv 值需 ×S。
+3. cap/join 对渲染影响小（仅端点/拐角形状），可后置或先不做（训练图中几百像素级差别）。
+4. 顺手清理 `dataset/renderer.py:116-121` 重复的 `elif seg.cmd == CMD_Q` 死分支（无害）。
+
+### 11.17.2 P4 effects 缺口（编码有 / 渲染无 / 损失有 / 导出无）
+
+| 环节 | 状态 | 位置 |
+|---|---|---|
+| 数据模型 | ✅ 有 | `svg/scene_graph.py:123-132` Effects：blur_radius/shadow_dx,dy,blur,rgb,alpha/glow_radius,rgb,alpha |
+| 数据生成 | ✅ 有 | `dataset/generator.py:282-296`，effects_prob=0.35，三分支 blur/shadow/glow |
+| 槽位编码 | ✅ 有 | `model/targets.py:205-217` encode（I_OPACITY..I_EGALPHA 250..263）；`:343-355` decode（>0.005 触发） |
+| squash/raw/硬化 | ✅ 有 | `model/spec.py:72-80`、`:349-357`、`:430-439`（E_MIN/E_MAX=0..0.20，SD ±0.20） |
+| 网络头 | ✅ 有 | `model/network.py:91` _FX_W=14，`fx_head`（h→14） |
+| 损失 | ✅ 有 | `model/losses.py:176-191` blur/sdx/sdy/sblur/esrgb/esalpha/glowr/egrgb/egalpha 全量 L1（GT 无效果处推向 0）；opacity 双处（:88-89、:135-136） |
+| **可微渲染** | ❌ **无** | `dataset/renderer.py:303-307` `_prepare` 只带 opacity（:305），**`obj.effects` 完全未读**；`_render_objs`（:485-529）只有 over 合成 |
+| **serializer** | ❌ **无** | `svg/serializer.py:121-122` 只写 opacity；不产任何 `<filter>` |
+
+**槽位契约结论：无需扩容**。effects 14 维已在 SLOT_DIM=280 契约内（275..279 备用也未用）。唯一已知扩容场景是 P2 渐变 stops 4→6（+10 维），与 P4 无关。
+
+**P4 实现要点与难度**：
+1. **crop 必须先扩**（前置条件）：`dataset/renderer.py:288-301` 与 `model/spec.py:237-245` 的 pad 只含 stroke 半宽，blur/glow 半径 + shadow 位移会溢出 crop 被截断。pad 改为 `pad_px + hw_px + blur半径·S + max(0,sdx,sdy)·S`。
+2. 可微 blur（低-中）：固定高斯核可分 conv2d，σ=blur_radius·S，作用于 crop 层 [4,h,w]（alpha 与 RGB 同卷）。
+3. shadow（中）：layer alpha → 偏移 (sdx,sdy)·S + blur → 用 shadow 色/alpha 着色 → **先于对象** over 合成（under）。
+4. glow（中）：layer alpha + blur + glow_rgb 加色合成。
+5. serializer filter（中）：blur→feGaussianBlur；shadow→feOffset+feGaussianBlur+feFlood/feComposite；glow→模糊副本加色。resvg 0.43 支持 filter 原语，写出即可用。
+6. 渲染开销：每对象多 2 次 conv + 多 1-2 个合成层，注意 sub_px=1 配置下 VRAM 与 it/s 回归（benchmarks/profile_step.py）。
+
+### 11.17.3 部署/评估侧连锁更新
+
+- `benchmarks/infer.py`：**结构无需改**（predict→harden→decode→prune→serialize 全链路已透传新字段）。但 `benchmarks/prune.py` 走 resvg（:61-138），serializer 支持 filter 后每次 ablation 渲染含特效，单场景耗时需重测（dash 无影响）。
+- `evaluate.py`：**口径必须同步**。img_in 用 soft renderer 生成（:37）——P3b/P4 落地后若 soft 渲染不画 dash/effects 而 pred SVG（经 serializer）画，mae/floor 失衡。渲染器实现后自动一致；若先做 serializer 后做渲染器，过渡期 floor 会被人为抬高。floor 走 encode→decode→resvg（:53-56），serializer 更新后 **GT floor 定义变化，历史基线数字不可直接对比，需重录**。
+- `train.py`：img_gt=ren.render_scene(scene)（:93），渲染器实现后自动获得监督，无需改。注意：effects_prob=0.35 + dash 全部进入渲染损失后，训练早期方差增大，按 §11.4 课程式先 dash 后 effects（可在 generator 加开关或权重退火）。
+
+### 11.17.4 建议实现顺序：**先 P3b，后 P4**
+
+理由：① P3b 总改动最小——losses/network/targets 零改动，serializer ~15 行，唯一难点是 renderer 可微 dash（单点）；② P3b 顺带修 serializer cap/join 硬编码 bug（现在导出的 SVG 语义就已错）；③ P4 是渲染器+crop 扩展+serializer filter 三处联动，且推高渲染与 prune 成本，宜在 P3b 打通"编码→渲染可见→损失→导出"全闭环验证方法论后再上。
+
+```
+P3b-a  serializer 补 dash/cap/join + 修硬编码 bug + round-trip 单测      [小]
+P3b-b  renderer/spec 可微 dash（弧长参数化 + smooth gate）               [中]
+P3b-c  evaluate/infer 回归 + dash 准确率探针（参照 probe_* 模式）        [小]
+P4-a   renderer blur（固定核可分 conv）+ crop 扩展（renderer+spec 两处） [中]
+P4-b   shadow / glow 合成                                                [中]
+P4-c   serializer filter 输出 + resvg 对照验证                           [中]
+P4-d   prune/evaluate 成本重测 + 课程式启用 effects + 重录基线           [小]
+```
+
+## §11.17 P3b dash：描边虚线接入 soft 渲染路径（2026-09-12 凌晨，E→D 转向后首个落地）
+
+**实现**（`dataset/renderer.py` + `model/spec.py`）：
+- `_softmin_true` → `_stroke_field(p, pts, closed, need_arclen, arclen_thresh)`：返回 (软距离 d, 软弧长 s)。d 与旧实现逐位一致；s = 最近点弧长的 softmax 距离加权估计（w_i ∝ exp(-(d_i-d_min)/zeta)，与 logsumexp 复用同一权重——角点附近像素的混合恰给出可微弧长过渡）。
+- `_dash_cover(s, dash)`：弧长 → 覆盖率软方波。奇数 dash 值按 SVG 规则倍增成偶数（pattern 恒以 off 结尾 → 无环绕问题）；on 区间 = σ((u-lo)/γ)·σ((hi-u)/γ)，边界张量可微；过渡宽度 γ 与描边带边缘一致。
+- **显存/梯度取舍（关键）**：弧长只对描边带内像素（d < hw+6γ，~1-5%）计算且 **no-grad**（s 作常量）——dash 梯度经 dash 值（lo/hi）回传，几何梯度由 band 项提供；pass-2 用 4000 像素小分块。全像素×全段数 autograd 保留在 256px 训练直接 OOM（实测两次）。cap/join 仍走辅助损失（P3b 范围 = dash；band 隐含 round cap/join）。
+- `spec.slots_to_objs`：ndash 硬取整（与 ftype argmax 同风格），nd=0 → 无 dash（与旧行为一致）；dash 值保持可微。GT/预测走同一路径，`_prepare` stroke_spec 扩为 4 元 (hw, rgb, alpha, dash|None)。
+
+**验证**（`benchmarks/check_spec_dash.py`，30 场景 stroke_attr_prob=1.0，22 含 dash）：
+- 管线一致性：GT 直渲 vs GT→raw→decode→soft 渲染 mae mean 0.0061 / max 0.032（OK，与无 dash 基线持平）
+- soft vs resvg（dash 场景）：mae mean 0.0131 / max 0.055（软方波边缘差异，可接受）
+- 梯度：dash 场景 dash 槽梯度 0.0004–0.009 非零，无 dash 场景恒 0；全程有限
+- 回归：check_spec25 OK_25（mean 0.0104）；60 步 GPU 冒烟 total 25.7→16.3、无 NaN、~3 it/s、VRAM 不超（runs/smoke_p3b）
+
+**下一步 = P4 effects**：可微 blur（可分卷积）/shadow（偏移+blur+合成）/glow（blur+加色），`spec.py` 接 `Effects`（数据模型已在 scene_graph）。训练仍从零（或 runs/genE2/last.pt 起步，几何无退化）。

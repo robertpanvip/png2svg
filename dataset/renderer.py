@@ -279,10 +279,15 @@ class SoftSVGRenderer:
 
             stroke_spec = None
             if obj.stroke is not None:
+                dash_t = None
+                if len(obj.stroke.dash) > 0:
+                    dash_t = torch.tensor([max(float(x), 0.0) for x in obj.stroke.dash[:4]],
+                                          dtype=self.dtype, device=self.device)
                 stroke_spec = (
                     torch.tensor(max(float(obj.stroke.width), 0.0) * 0.5, dtype=self.dtype, device=self.device),
                     torch.tensor(obj.stroke.color, dtype=self.dtype, device=self.device),
                     torch.tensor(float(obj.stroke.alpha), dtype=self.dtype, device=self.device),
+                    dash_t,
                 )
 
             bb = g.bbox
@@ -330,25 +335,91 @@ class SoftSVGRenderer:
         for i in range(0, n, step):
             yield i, min(i + step, n)
 
-    def _softmin_true(self, p: torch.Tensor, pts: torch.Tensor, closed: bool = True):
+    def _chunks_small(self, n: int, step: int = 4000):
+        """pass-2 弧长小分块：控制瞬时中间张量峰值（P3b）。"""
+        for i in range(0, n, step):
+            yield i, min(i + step, n)
+
+    def _stroke_field(self, p: torch.Tensor, pts: torch.Tensor, closed: bool = True,
+                      need_arclen: bool = False, arclen_thresh: float = None):
+        """软距离场 + 可选软弧长坐标（P3b dash，HANDOFF §11.17）。
+
+        d = d_min - zeta·logsumexp（与旧 _softmin_true 完全一致）；
+        s = 最近点弧长的 softmax 距离加权估计（w_i ∝ exp(-(d_i-d_min)/zeta)，
+        复用同一权重——像素在角点附近的混合恰好给出可微的弧长过渡）。
+
+        显存控制：弧长只对 d < arclen_thresh 的像素（描边带内，~1-5%）计算，
+        scatter 回全长——全像素×全段数的中间张量在 256px 训练会 OOM。
+        """
         zeta = self.zeta
         a_full = pts if closed else pts[:-1]
         b_full = torch.roll(pts, -1, dims=0) if closed else pts[1:]
         a = a_full.unsqueeze(0)
         b = b_full.unsqueeze(0)
-        ab = b - a
+        ab = b - a                                              # (1, M, 2) 广播形状
+        seg_len = ab.norm(dim=-1)[0]                                # (M,)
         len2 = (ab * ab).sum(-1).clamp_min(_EPS)
-        out = []
+        cum = torch.cat([pts.new_zeros(1), torch.cumsum(seg_len, 0)])[:-1]  # 段起点弧长
+        ds = []
         for i, j in self._chunks(p.shape[0]):
             pc = p[i:j]
             ap = pc.unsqueeze(1) - a
             t = ((ap * ab).sum(-1) / len2).clamp(0.0, 1.0)
             proj = a + ab * t.unsqueeze(-1)
-            d = (pc.unsqueeze(1) - proj).norm(dim=-1)
+            d = (pc.unsqueeze(1) - proj).norm(dim=-1)               # (N, M)
             d_min = d.min(dim=1).values
-            agg = torch.log(torch.exp(-(d - d_min.unsqueeze(1)) / zeta).clamp_min(1e-30).sum(dim=1))
-            out.append(d_min - zeta * agg)
-        return torch.cat(out)
+            w = torch.exp(-(d - d_min.unsqueeze(1)) / zeta).clamp_min(1e-30)
+            agg = torch.log(w.sum(dim=1))
+            ds.append(d_min - zeta * agg)
+        d_all = torch.cat(ds)
+        if not need_arclen:
+            return d_all, None
+
+        sel = d_all.detach() < arclen_thresh                        # (N,) bool
+        if int(sel.sum()) == 0:
+            return d_all, torch.zeros_like(d_all)
+        # 弧长 s 作为 no-grad 常量：dash 梯度经 dash 值（lo/hi）回传，
+        # 几何梯度由 band 项提供——s 的 autograd 保留会 OOM（256px 训练）
+        with torch.no_grad():
+            p_sel = p[sel]
+            ss = []
+            for i, j in self._chunks(p_sel.shape[0]) if p_sel.shape[0] <= self.chunk_points \
+                    else self._chunks_small(p_sel.shape[0]):
+                pc = p_sel[i:j]
+                ap = pc.unsqueeze(1) - a
+                t = ((ap * ab).sum(-1) / len2).clamp(0.0, 1.0)
+                proj = a + ab * t.unsqueeze(-1)
+                d_sel = (pc.unsqueeze(1) - proj).norm(dim=-1)
+                d_min = d_sel.min(dim=1).values
+                w = torch.exp(-(d_sel - d_min.unsqueeze(1)) / zeta).clamp_min(1e-30)
+                s_i = cum.unsqueeze(0) + t * seg_len.unsqueeze(0)   # (n_sel, M)
+                wsum = w.sum(dim=1).clamp_min(1e-30)
+                ss.append((w * s_i).sum(dim=1) / wsum)
+            s_sel = torch.cat(ss)
+        s_all = torch.zeros(d_all.shape, dtype=d_all.dtype, device=d_all.device)
+        s_all[sel] = s_sel
+        return d_all, s_all
+
+    def _dash_cover(self, s: torch.Tensor, dash: torch.Tensor) -> torch.Tensor:
+        """弧长 → dash 覆盖率 ∈[0,1]（软方波，P3b）。
+
+        奇数个 dash 值按 SVG 规则倍增成偶数；pattern 恒以 off 段结尾，
+        故 [0,P) 内的 on 区间无环绕问题。过渡宽度用 gamma（与描边带边缘一致）。
+        """
+        n = int(dash.numel())
+        pat = dash if n % 2 == 0 else torch.cat([dash, dash], dim=0)
+        pat = pat.clamp_min(1e-4)
+        offs = torch.cumsum(pat, dim=0)                 # 可微：保留 dash 梯度
+        starts = offs - pat
+        period = float(offs[-1].detach())
+        u = s - period * torch.floor(s / period)
+        g = self.gamma
+        cover = torch.zeros_like(s)
+        for i in range(0, int(pat.numel()), 2):         # 偶数下标 = on
+            if float((offs[i] - starts[i]).detach()) < 1e-6:
+                continue
+            cover = cover + torch.sigmoid((u - starts[i]) / g) * torch.sigmoid((offs[i] - u) / g)
+        return cover.clamp(0.0, 1.0)
 
     def _parity_coverage(self, p: torch.Tensor, pts_list):
         gamma = self.gamma
@@ -378,31 +449,34 @@ class SoftSVGRenderer:
             outs.append(0.5 * (1.0 - torch.cos(torch.pi * crossings.abs())))
         return torch.cat(outs)
 
-    def _object_coverage(self, geo, p: torch.Tensor):
+    def _object_coverage(self, geo, p: torch.Tensor, need_arclen: bool = False,
+                         arclen_thresh: float = None):
         kind, data = geo
         gamma = self.gamma
         if kind == "circle":
             cx, cy, r = data
             c = torch.stack([_tt(cx, p.dtype, p.device), _tt(cy, p.dtype, p.device)])
             d = (p - c).norm(dim=1) - _tt(r, p.dtype, p.device)
-            return [torch.sigmoid(-d / gamma)], [d.abs()]
+            return [torch.sigmoid(-d / gamma)], [(d.abs(), None)]
         if kind == "rect":
             cx, cy, w, h = data
             c = torch.stack([_tt(cx, p.dtype, p.device), _tt(cy, p.dtype, p.device)])
             half = torch.stack([_tt(w, p.dtype, p.device), _tt(h, p.dtype, p.device)]) / 2
             q = (p - c).abs() - half
             d = q.clamp_min(0.0).norm(dim=1) + q.clamp(max=0.0).max(dim=1).values
-            return [torch.sigmoid(-d / gamma)], [d.abs()]
+            return [torch.sigmoid(-d / gamma)], [(d.abs(), None)]
         fill_pts = [pts for pts, closed in data if closed and len(pts) >= 3]
         if fill_pts:
             fill_cov = [self._parity_coverage(p, fill_pts)]
         else:
             fill_cov = []
-        dists = []
+        fields = []
         for pts, closed in data:
             pts = pts if torch.is_tensor(pts) else torch.tensor(pts, dtype=p.dtype, device=p.device)
-            dists.append(self._softmin_true(p, pts, closed=closed))
-        return fill_cov, dists
+            fields.append(self._stroke_field(p, pts, closed=closed,
+                                             need_arclen=need_arclen,
+                                             arclen_thresh=arclen_thresh))
+        return fill_cov, fields
 
     def _eval_gradient(self, spec, p: torch.Tensor):
         tensors = spec[1]
@@ -436,7 +510,14 @@ class SoftSVGRenderer:
     def _object_layer(self, item):
         x0, y0, x1, y1 = item["crop"]
         p = self._pixel_grid(x0, y0, x1, y1)
-        fills, dists = self._object_coverage(item["geo"], p)
+        dash = item["stroke"][3] if (item["stroke"] is not None and len(item["stroke"]) > 3) else None
+        need_s = dash is not None and dash.numel() > 0
+        thresh = None
+        if need_s:
+            hw_px = float(item["stroke"][0].detach())
+            thresh = hw_px + 6.0 * self.gamma
+        fills, fields = self._object_coverage(item["geo"], p, need_arclen=need_s,
+                                              arclen_thresh=thresh)
 
         fill_cov = None
         for a_sub in fills:
@@ -445,8 +526,10 @@ class SoftSVGRenderer:
         stroke_cov = None
         if item["stroke"] is not None:
             hw = item["stroke"][0]
-            for d in dists:
+            for d, s in fields:
                 band = torch.sigmoid((hw - d) / self.gamma)
+                if need_s and s is not None:
+                    band = band * self._dash_cover(s, dash)
                 stroke_cov = band if stroke_cov is None else torch.maximum(stroke_cov, band)
 
         pm_rgb = None
@@ -462,7 +545,7 @@ class SoftSVGRenderer:
             pm_rgb = color * a.unsqueeze(-1)
             pm_a = a.unsqueeze(-1)
         if stroke_cov is not None:
-            _, scolor, salpha = item["stroke"]
+            _, scolor, salpha = item["stroke"][:3]
             a = (stroke_cov * salpha).unsqueeze(-1)
             if pm_rgb is None:
                 pm_rgb = scolor.unsqueeze(0) * a

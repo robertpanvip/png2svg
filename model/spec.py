@@ -250,8 +250,9 @@ def slots_to_objs(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
                   canvas: int, pad_px: float, curve_samples: int = CURVE_SAMPLES):
     """新契约：段表 → 渲染 dict 列表（几何/填充/描边可微）。
 
-    dash/cap/join、effects、clip/mask 暂不在 soft 渲染路径中
-    （GT 与预测一致忽略，辅助损失监督；见 HANDOFF §11.6 渲染器契约注记）。
+    P3b（HANDOFF §11.17）：dash 已接入 soft 渲染路径（GT 与预测一致，
+    ndash 硬取整、dash 值可微）。cap/join、effects、clip/mask 仍不在
+    soft 渲染路径（辅助损失监督，见 HANDOFF §11.6 渲染器契约注记）。
     """
     f = squash_slots(slots_raw)
     objs = []
@@ -281,8 +282,15 @@ def slots_to_objs(slots_raw: torch.Tensor, bg_raw: torch.Tensor,
                 fill_spec = (kind, grad, gate)
 
         hw = 0.5 * f["sw"][k]
+        # P3b dash（HANDOFF §11.17）：ndash 硬取整（与 ftype argmax 同风格），
+        # dash 值保持可微（渲染损失可回传）；nd=0 → 无 dash，与旧行为一致
+        dash_t = None
+        nd = int(np.clip(round(float(f["ndash"][k].detach())), 0, NUM_DASH))
+        if nd > 0 and float(f["stroke_valid"][k].detach()) > 0.5:
+            dash_t = f["dash"][k][:nd]
         stroke_spec = (hw, f["stroke_rgb"][k],
-                       f["stroke_alpha"][k] * f["stroke_valid"][k] * valid)
+                       f["stroke_alpha"][k] * f["stroke_valid"][k] * valid,
+                       dash_t)
 
         opacity = f["opacity"][k] * valid
         objs.append({"geo": geo, "fill": fill_spec, "stroke": stroke_spec,
